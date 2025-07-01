@@ -3,10 +3,17 @@
   "version": "0.1.0",
   "license": "MIT",
   "author": {
-    "name": "Eric",
-    "email": "airkro@qq.com"
+    "name": "Eric Chen"
   },
   "keywords": [],
+  "homepage": "https://github.com/Airkro/bin-linker",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Airkro/bin-linker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Airkro/bin-linker/issues"
+  },
   "bin": {
     "bin-linker": "src/index.mjs"
   },

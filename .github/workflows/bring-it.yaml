@@ -1,0 +1,27 @@
+name: bring-it
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Run
+        uses: airkro/bring-it@actions
+
+  publish:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run
+        uses: airkro/bring-it@actions
+        with:
+          npm-token: ${{ secrets.NPM_TOKEN }}

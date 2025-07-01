@@ -30,7 +30,7 @@ function handleError(err) {
  */
 function showUsage() {
   log.warn('请指定要链接的包名');
-  log.info('用法: bin-linker <package-name> [<package-name>...]');
+  log.info('Usage: bin-linker <package-name> [<package-name>...]');
 
   return 0;
 }
