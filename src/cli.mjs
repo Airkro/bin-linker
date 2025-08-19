@@ -1,4 +1,4 @@
-import { linkPackages } from './core.mjs';
+import { linkPackageBins } from './core.mjs';
 import { fmt, log } from './output.mjs';
 
 /**
@@ -80,7 +80,7 @@ export async function run() {
       return showUsage();
     }
 
-    const result = await linkPackages(packages);
+    const result = await linkPackageBins(packages);
 
     return showResults(result);
   } catch (error) {

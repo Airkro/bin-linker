@@ -1,6 +1,6 @@
 {
   "name": "bin-linker",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT",
   "author": {
     "name": "Eric Chen"
@@ -26,15 +26,15 @@
     "picocolors": "^1.1.1"
   },
   "devDependencies": {
-    "@bring-it/npm": "^0.6.1",
-    "@nice-move/all-in-base": "^0.5.1",
-    "eslint": "^9.30.0",
-    "garou": "^0.9.11",
+    "@bring-it/npm": "^0.8.3",
+    "@nice-move/all-in-base": "^0.6.8",
+    "eslint": "^9.33.0",
+    "garou": "^0.9.13",
     "prettier": "^3.6.2"
   },
-  "packageManager": "pnpm@10.12.4",
+  "packageManager": "pnpm@10.14.0",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.18.0"
   },
   "publishConfig": {
     "access": "public",
