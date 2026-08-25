@@ -93,7 +93,7 @@ const fileExists = async (filePath: string): Promise<boolean> =>
  */
 export async function readPackageJson(
   pkg: string,
-): Promise<{ bin?: Record<string, string> } | null> {
+): Promise<{ bin?: string | Record<string, string> } | null> {
   const pkgPath = path.join(pnpmGlobalPath, pkg, 'package.json');
 
   if (!(await fileExists(pkgPath))) {

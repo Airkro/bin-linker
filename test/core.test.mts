@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import path from 'node:path';
 
 const mocks = vi.hoisted(() => ({
   createSymlink: vi.fn(),
@@ -71,6 +72,30 @@ describe('linkPackageBins', () => {
 
     expect(result.results[0]?.commands).toEqual(['first']);
     expect(result.results[0]?.errors?.[0]?.name).toBe('second');
+  });
+
+  it('links a string bin using the package name as the command name', async () => {
+    mocks.readPackageJson.mockResolvedValue({ bin: './bin/cli.js' });
+
+    const result = await linkPackageBins(['tool']);
+
+    expect(result.results[0]?.commands).toEqual(['tool']);
+    expect(mocks.createSymlink).toHaveBeenCalledWith(
+      path.join('/global/node_modules', 'tool', 'bin/cli.js'),
+      path.join('/project/node_modules/.bin', 'tool'),
+    );
+  });
+
+  it('uses the unscoped package name for a scoped string bin', async () => {
+    mocks.readPackageJson.mockResolvedValue({ bin: 'cli.js' });
+
+    const result = await linkPackageBins(['@scope/tool']);
+
+    expect(result.results[0]?.commands).toEqual(['tool']);
+    expect(mocks.createSymlink).toHaveBeenCalledWith(
+      path.join('/global/node_modules', '@scope/tool', 'cli.js'),
+      path.join('/project/node_modules/.bin', 'tool'),
+    );
   });
 
   it('continues after package linking and metadata errors', async () => {

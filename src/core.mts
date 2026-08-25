@@ -20,6 +20,17 @@ type PkgResult = {
   errors?: PkgError[];
 };
 
+function getBinEntries(
+  pkg: string,
+  bin: string | Record<string, string> | undefined,
+): Array<[string, string]> {
+  if (typeof bin === 'string') {
+    return [[path.basename(pkg), bin]];
+  }
+
+  return Object.entries(bin ?? {});
+}
+
 /**
  * 安全删除文件（忽略文件不存在的错误）
  */
@@ -84,7 +95,7 @@ async function linkPackageBin(pkg: string): Promise<PkgResult> {
     };
   }
 
-  const binEntries = Object.entries(pkgJson.bin || {});
+  const binEntries = getBinEntries(pkg, pkgJson.bin);
 
   if (binEntries.length === 0) {
     return { pkg, commands: [], noBin: true };
