@@ -1,13 +1,68 @@
 import { execSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 // 常量定义
 export const isWindows = process.platform === 'win32';
 
-export const pnpmGlobalPath = execSync('pnpm root -g', {
-  encoding: 'utf8',
-}).trim();
+/**
+ * pnpm 11 checks that its global bin directory is in PATH even for `root -g`.
+ * Temporarily add the likely pnpm home/bin locations so the query remains
+ * compatible with pnpm 10 and pnpm 11, then restore the caller's environment.
+ */
+function getPnpmGlobalPath(): string {
+  const {
+    PATH: originalPath,
+    npm_config_global_bin_dir: globalBinDir,
+    PNPM_HOME: pnpmHome,
+    LOCALAPPDATA: localAppData,
+    XDG_DATA_HOME: xdgDataHome,
+  } = process.env;
+  const configuredBinDirs = [
+    globalBinDir,
+    pnpmHome && path.join(pnpmHome, 'bin'),
+    pnpmHome,
+  ].filter(Boolean);
+
+  const defaultHome = (() => {
+    if (isWindows) {
+      return localAppData
+        ? path.join(localAppData, 'pnpm')
+        : path.join(os.homedir(), 'AppData', 'Local', 'pnpm');
+    }
+
+    if (process.platform === 'darwin') {
+      return path.join(os.homedir(), 'Library', 'pnpm');
+    }
+
+    return path.join(
+      xdgDataHome ?? path.join(os.homedir(), '.local', 'share'),
+      'pnpm',
+    );
+  })();
+
+  const pathEntries = (process.env.PATH ?? '').split(path.delimiter);
+  process.env.PATH = [
+    ...new Set([
+      ...configuredBinDirs,
+      path.join(defaultHome, 'bin'),
+      ...pathEntries,
+    ]),
+  ].join(path.delimiter);
+
+  try {
+    return execSync('pnpm root -g', { encoding: 'utf8' }).trim();
+  } finally {
+    if (originalPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = originalPath;
+    }
+  }
+}
+
+export const pnpmGlobalPath = getPnpmGlobalPath();
 
 export const localBinDir = path.resolve(process.cwd(), 'node_modules', '.bin');
 

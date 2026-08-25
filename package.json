@@ -1,6 +1,6 @@
 {
   "name": "bin-linker",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "license": "MIT",
   "author": {
     "name": "Eric Chen"
@@ -15,7 +15,7 @@
     "url": "https://github.com/Airkro/bin-linker/issues"
   },
   "bin": {
-    "bin-linker": "lib/index.mts"
+    "bin-linker": "lib/index.mjs"
   },
   "files": [
     "lib"
@@ -27,7 +27,10 @@
     "lint:eslint": "eslint . --quiet --fix --concurrency=auto",
     "lint:staged": "nice-move lint staged",
     "lint:type": "tsc -p tsconfig.json",
-    "prepare": "nice-move git hooks"
+    "prepare": "nice-move git hooks",
+    "prepublishOnly": "pnpm run lint:type && pnpm test && pnpm run build",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "picocolors": "^1.1.1"
@@ -35,10 +38,12 @@
   "devDependencies": {
     "@bring-it/npm": "^0.9.6",
     "@nice-move/all-in-base": "^0.8.13",
+    "@vitest/coverage-v8": "^4.1.11",
     "eslint": "^9.39.5",
     "garou": "^0.9.21",
     "prettier": "~3.9.6",
-    "typescript": "~6.0.3"
+    "typescript": "~6.0.3",
+    "vitest": "^4.1.11"
   },
   "packageManager": "pnpm@10.34.5",
   "engines": {

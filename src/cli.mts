@@ -60,7 +60,7 @@ function showResults({
     } else if (pkgResult.noBin) {
       log.warn(`包 ${fmt.pkg(pkgResult.pkg)} 没有可执行文件`);
     } else if ((pkgResult.commands?.length ?? 0) > 0) {
-      const commands = pkgResult.commands ?? [];
+      const commands = pkgResult.commands as string[];
       log.info(
         `${fmt.pkg(pkgResult.pkg)}: 已链接 ${fmt.list(
           commands.map((cmd: string) => fmt.cmd(cmd)),
