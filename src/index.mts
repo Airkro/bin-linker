@@ -1,11 +1,10 @@
-#!/usr/bin/env node
-import { run } from './cli.mjs';
-import { log } from './output.mjs';
+import { run } from './cli.mts';
+import { log } from './output.mts';
 
 /**
  * 处理未捕获的异常
  */
-function handleUncaughtError(error) {
+function handleUncaughtError(error: Error): void {
   log.error(`程序错误: ${error.message}`);
   process.exitCode = 1;
 }

@@ -1,11 +1,11 @@
-import { linkPackageBins } from './core.mjs';
-import { fmt, log } from './output.mjs';
+import { linkPackageBins } from './core.mts';
+import { fmt, log } from './output.mts';
 
 /**
  * 处理错误并返回退出码
  */
-function handleError(err) {
-  const errorHandlers = {
+function handleError(err: NodeJS.ErrnoException): number {
+  const handlers = {
     EPERM: () => {
       log.error(
         '需要管理员权限运行！在 Windows 上请以管理员身份运行命令提示符',
@@ -20,7 +20,10 @@ function handleError(err) {
     default: () => log.error(`操作失败: ${err.message}`),
   };
 
-  (errorHandlers[err.code] || errorHandlers.default)();
+  const key = err.code as keyof typeof handlers;
+  const handler =
+    err.code && key in handlers ? handlers[key] : handlers.default;
+  handler();
 
   return 1;
 }
@@ -28,7 +31,7 @@ function handleError(err) {
 /**
  * 显示使用说明
  */
-function showUsage() {
+function showUsage(): number {
   log.warn('请指定要链接的包名');
   log.info('Usage: bin-linker <package-name> [<package-name>...]');
 
@@ -38,7 +41,17 @@ function showUsage() {
 /**
  * 显示链接结果
  */
-function showResults({ results }) {
+function showResults({
+  results,
+}: {
+  results: Array<{
+    pkg: string;
+    commands?: string[];
+    notFound?: boolean;
+    noBin?: boolean;
+    errors?: Array<{ name: string; error: Error }>;
+  }>;
+}): number {
   let linkedCount = 0;
 
   results.forEach((pkgResult) => {
@@ -46,11 +59,14 @@ function showResults({ results }) {
       log.warn(`找不到包: ${fmt.pkg(pkgResult.pkg)}`);
     } else if (pkgResult.noBin) {
       log.warn(`包 ${fmt.pkg(pkgResult.pkg)} 没有可执行文件`);
-    } else if (pkgResult.commands.length > 0) {
+    } else if ((pkgResult.commands?.length ?? 0) > 0) {
+      const commands = pkgResult.commands ?? [];
       log.info(
-        `${fmt.pkg(pkgResult.pkg)}: 已链接 ${fmt.list(pkgResult.commands.map((cmd) => fmt.cmd(cmd)))}`,
+        `${fmt.pkg(pkgResult.pkg)}: 已链接 ${fmt.list(
+          commands.map((cmd: string) => fmt.cmd(cmd)),
+        )}`,
       );
-      linkedCount += pkgResult.commands.length;
+      linkedCount += commands.length;
     }
 
     pkgResult.errors?.forEach(({ name, error }) => {
@@ -70,7 +86,7 @@ function showResults({ results }) {
 /**
  * CLI主函数
  */
-export async function run() {
+export async function run(): Promise<number> {
   try {
     const packages = process.argv
       .slice(2)
@@ -84,6 +100,6 @@ export async function run() {
 
     return showResults(result);
   } catch (error) {
-    return handleError(error);
+    return handleError(error as NodeJS.ErrnoException);
   }
 }

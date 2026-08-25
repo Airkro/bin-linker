@@ -8,16 +8,26 @@ import {
   localBinDir,
   pnpmGlobalPath,
   readPackageJson,
-} from './fs.mjs';
+} from './fs.mts';
+
+type PkgError = { name: string; error: Error };
+
+type PkgResult = {
+  pkg: string;
+  commands?: string[];
+  notFound?: boolean;
+  noBin?: boolean;
+  errors?: PkgError[];
+};
 
 /**
  * 安全删除文件（忽略文件不存在的错误）
  */
-async function safeUnlink(filePath) {
+async function safeUnlink(filePath: string): Promise<void> {
   try {
     await fs.unlink(filePath);
   } catch (error) {
-    if (error.code !== 'ENOENT') {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw error;
     }
   }
@@ -26,18 +36,18 @@ async function safeUnlink(filePath) {
 /**
  * 处理Windows权限错误
  */
-function handleWindowsPermError(error) {
-  if (isWindows && error.code === 'EPERM') {
+function handleWindowsPermError(error: unknown): Error {
+  if (isWindows && (error as NodeJS.ErrnoException).code === 'EPERM') {
     throw error;
   }
 
-  return error;
+  return error as Error;
 }
 
 /**
  * 链接单个包
  */
-async function linkPackage(pkg) {
+async function linkPackage(pkg: string): Promise<boolean> {
   const packageTarget = path.join(pnpmGlobalPath, pkg);
   const packageLink = path.join(process.cwd(), 'node_modules', pkg);
 
@@ -57,7 +67,7 @@ async function linkPackage(pkg) {
 /**
  * 链接单个包的可执行文件
  */
-async function linkPackageBin(pkg) {
+async function linkPackageBin(pkg: string): Promise<PkgResult> {
   const pkgJson = await readPackageJson(pkg);
 
   if (!pkgJson) {
@@ -67,7 +77,11 @@ async function linkPackageBin(pkg) {
   try {
     await linkPackage(pkg);
   } catch (error) {
-    return { pkg, commands: [], errors: [error] };
+    return {
+      pkg,
+      commands: [],
+      errors: [{ name: pkg, error: error as Error }],
+    };
   }
 
   const binEntries = Object.entries(pkgJson.bin || {});
@@ -76,7 +90,7 @@ async function linkPackageBin(pkg) {
     return { pkg, commands: [], noBin: true };
   }
 
-  const result = { pkg, commands: [], errors: [] };
+  const result: PkgResult = { pkg, commands: [], errors: [] };
 
   for (const [name, relPath] of binEntries) {
     const target = path.join(pnpmGlobalPath, pkg, relPath);
@@ -84,10 +98,10 @@ async function linkPackageBin(pkg) {
 
     try {
       await createSymlink(target, link);
-      result.commands.push(name);
+      (result.commands ??= []).push(name);
     } catch (error) {
       const processedError = handleWindowsPermError(error);
-      result.errors.push({ name, error: processedError });
+      (result.errors ??= []).push({ name, error: processedError });
     }
   }
 
@@ -97,7 +111,9 @@ async function linkPackageBin(pkg) {
 /**
  * 链接多个包的可执行文件
  */
-export async function linkPackageBins(packages = []) {
+export async function linkPackageBins(
+  packages: string[] = [],
+): Promise<{ results: PkgResult[] }> {
   if (packages.length === 0) {
     return { results: [] };
   }
@@ -106,14 +122,14 @@ export async function linkPackageBins(packages = []) {
     throw new Error('无法创建目标目录');
   }
 
-  const results = [];
+  const results: PkgResult[] = [];
 
   for (const pkg of packages) {
     try {
       results.push(await linkPackageBin(pkg));
     } catch (error) {
       const processedError = handleWindowsPermError(error);
-      results.push({ pkg, errors: [processedError] });
+      results.push({ pkg, errors: [{ name: pkg, error: processedError }] });
     }
   }
 

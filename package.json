@@ -15,26 +15,35 @@
     "url": "https://github.com/Airkro/bin-linker/issues"
   },
   "bin": {
-    "bin-linker": "src/index.mjs"
+    "bin-linker": "lib/index.mts"
   },
+  "files": [
+    "lib"
+  ],
   "type": "module",
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "fmt:prettier": "prettier -w .",
+    "lint:eslint": "eslint . --quiet --fix --concurrency=auto",
     "lint:staged": "nice-move lint staged",
+    "lint:type": "tsc -p tsconfig.json",
     "prepare": "nice-move git hooks"
   },
   "dependencies": {
     "picocolors": "^1.1.1"
   },
   "devDependencies": {
-    "@bring-it/npm": "^0.8.3",
-    "@nice-move/all-in-base": "^0.6.8",
-    "eslint": "^9.33.0",
-    "garou": "^0.9.13",
-    "prettier": "^3.6.2"
+    "@bring-it/npm": "^0.9.6",
+    "@nice-move/all-in-base": "^0.8.13",
+    "eslint": "^9.39.5",
+    "garou": "^0.9.21",
+    "prettier": "~3.9.6",
+    "typescript": "~6.0.3"
   },
-  "packageManager": "pnpm@10.14.0",
+  "packageManager": "pnpm@10.34.5",
   "engines": {
-    "node": ">=22.18.0"
+    "node": ">=22.18.0",
+    "pnpm": "^10.33.2"
   },
   "publishConfig": {
     "access": "public",

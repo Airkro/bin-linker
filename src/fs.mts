@@ -14,7 +14,7 @@ export const localBinDir = path.resolve(process.cwd(), 'node_modules', '.bin');
 /**
  * 确保目录存在，如果不存在则创建
  */
-export async function ensureDir(dir) {
+export async function ensureDir(dir: string): Promise<boolean> {
   try {
     await fs.mkdir(dir, { recursive: true });
 
@@ -27,7 +27,7 @@ export async function ensureDir(dir) {
 /**
  * 检查文件是否存在
  */
-const fileExists = async (filePath) =>
+const fileExists = async (filePath: string): Promise<boolean> =>
   fs
     .access(filePath)
     .then(() => true)
@@ -36,7 +36,9 @@ const fileExists = async (filePath) =>
 /**
  * 读取包的package.json文件
  */
-export async function readPackageJson(pkg) {
+export async function readPackageJson(
+  pkg: string,
+): Promise<{ bin?: Record<string, string> } | null> {
   const pkgPath = path.join(pnpmGlobalPath, pkg, 'package.json');
 
   if (!(await fileExists(pkgPath))) {
@@ -55,7 +57,10 @@ export async function readPackageJson(pkg) {
 /**
  * 创建符号链接
  */
-export async function createSymlink(target, link) {
+export async function createSymlink(
+  target: string,
+  link: string,
+): Promise<boolean> {
   // 检查目标是否存在
   if (!(await fileExists(target))) {
     throw new Error(`目标不存在: ${target}`);
@@ -63,7 +68,7 @@ export async function createSymlink(target, link) {
 
   // 如果链接已存在，先删除
   await fs.unlink(link).catch((error) => {
-    if (error.code !== 'ENOENT') {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw error;
     } // 忽略文件不存在的错误
   });
