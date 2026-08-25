@@ -95,12 +95,58 @@ const fileExists = async (filePath: string): Promise<boolean> =>
     .catch(() => false);
 
 /**
+ * 检查路径是否为目录
+ */
+async function isDirectory(dirPath: string): Promise<boolean> {
+  try {
+    const stat = await fs.stat(dirPath);
+
+    return stat.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 解析全局包的实际根目录。
+ *
+ * pnpm 10 的 `pnpm root -g` 返回的全局根目录直接包含包目录（`<root>/<pkg>`）；
+ * pnpm 11 改用了内容寻址的全局存储，包实际位于
+ * `<root>/<virtualDir>/node_modules/<pkg>`（`virtualDir` 为哈希目录名，不固定）。
+ * 该函数依次尝试两种布局，找不到包时返回 null。
+ */
+export async function resolveGlobalPkgDir(pkg: string): Promise<string | null> {
+  // pnpm 10：包直接位于全局根目录下
+  const direct = path.join(pnpmGlobalPath, pkg);
+  if (await isDirectory(direct)) {
+    return direct;
+  }
+
+  // pnpm 11：包位于 <root>/<virtualDir>/node_modules/<pkg>
+  const entries = await fs.readdir(pnpmGlobalPath).catch(() => []);
+  for (const entry of entries) {
+    const candidate = path.join(pnpmGlobalPath, entry, 'node_modules', pkg);
+    if (await isDirectory(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+/**
  * 读取包的package.json文件
  */
 export async function readPackageJson(
   pkg: string,
 ): Promise<{ bin?: string | Record<string, string> } | null> {
-  const pkgPath = path.join(pnpmGlobalPath, pkg, 'package.json');
+  const pkgDir = await resolveGlobalPkgDir(pkg);
+
+  if (!pkgDir) {
+    return null;
+  }
+
+  const pkgPath = path.join(pkgDir, 'package.json');
 
   if (!(await fileExists(pkgPath))) {
     return null;

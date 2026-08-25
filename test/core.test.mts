@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   ensureDir: vi.fn(),
   isWindows: true,
   readPackageJson: vi.fn(),
+  resolveGlobalPkgDir: vi.fn(),
   symlink: vi.fn(),
   unlink: vi.fn(),
 }));
@@ -19,6 +20,7 @@ vi.mock('../src/fs.mts', () => ({
   localBinDir: '/project/node_modules/.bin',
   pnpmGlobalPath: '/global/node_modules',
   readPackageJson: mocks.readPackageJson,
+  resolveGlobalPkgDir: mocks.resolveGlobalPkgDir,
 }));
 vi.mock('node:fs', () => ({
   promises: {
@@ -37,6 +39,9 @@ describe('linkPackageBins', () => {
     mocks.unlink.mockRejectedValue({ code: 'ENOENT' });
     mocks.symlink.mockResolvedValue(undefined);
     mocks.createSymlink.mockResolvedValue(true);
+    mocks.resolveGlobalPkgDir.mockImplementation(async (pkg: string) =>
+      path.join('/global/node_modules', pkg),
+    );
   });
 
   it('returns no results for an empty package list', async () => {
@@ -58,6 +63,16 @@ describe('linkPackageBins', () => {
         { pkg: 'library', commands: [], noBin: true },
       ],
     });
+  });
+
+  it('reports packages that cannot be located in the global store', async () => {
+    // resolveGlobalPkgDir 在全局存储中找不到包目录时返回 null
+    mocks.resolveGlobalPkgDir.mockResolvedValue(null);
+
+    await expect(linkPackageBins(['ghost'])).resolves.toEqual({
+      results: [{ pkg: 'ghost', commands: [], notFound: true }],
+    });
+    expect(mocks.readPackageJson).not.toHaveBeenCalled();
   });
 
   it('links all binaries and records individual failures', async () => {
