@@ -52,7 +52,13 @@ function getPnpmGlobalPath(): string {
   ].join(path.delimiter);
 
   try {
-    return execSync('pnpm root -g', { encoding: 'utf8' }).trim();
+    const output = execSync('pnpm root -g', { encoding: 'utf8' });
+    const paths = output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => path.isAbsolute(line));
+
+    return paths.at(-1) ?? output.trim();
   } finally {
     if (originalPath === undefined) {
       delete process.env.PATH;

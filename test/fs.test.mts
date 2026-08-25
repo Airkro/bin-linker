@@ -125,4 +125,27 @@ describe('filesystem helpers', () => {
       }
     }
   });
+
+  it('ignores pnpm warnings printed before the global root', async () => {
+    mocks.execSync.mockReturnValue(
+      '[WARN] Using --global skips the package manager check for this project\n' +
+        '/pnpm/global/v11/node_modules\n',
+    );
+    vi.resetModules();
+
+    // @ts-expect-error Vitest supports query strings for isolated module imports.
+    const warningFs = await import('../src/fs.mts?pnpm-warning');
+
+    expect(warningFs.pnpmGlobalPath).toBe('/pnpm/global/v11/node_modules');
+  });
+
+  it('falls back to trimmed pnpm output when no absolute path is present', async () => {
+    mocks.execSync.mockReturnValue('global root unavailable\n');
+    vi.resetModules();
+
+    // @ts-expect-error Vitest supports query strings for isolated module imports.
+    const fallbackFs = await import('../src/fs.mts?pnpm-root-fallback');
+
+    expect(fallbackFs.pnpmGlobalPath).toBe('global root unavailable');
+  });
 });
