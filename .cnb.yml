@@ -9,9 +9,11 @@ patch:
           - cnb:arch:amd64
       docker:
         image: node:lts-alpine
+        # 数据卷 path 一律用绝对路径，且不能互为包含关系
+        # （.pnpm-store 与 node_modules 就在工作区下，用相对路径会与工作区挂载冲突）
         volumes:
-          - ${CNB_BRANCH}:/workspace/.pnpm-store:copy-on-write
-          - ${CNB_BRANCH}:/workspace/node_modules:copy-on-write
+          - /workspace/.pnpm-store
+          - /workspace/node_modules
       env:
         XDG_DATA_HOME: /home/.share
         PNPM_HOME: /home/.share/pnpm
@@ -27,7 +29,13 @@ patch:
           script: pnpm run lint:type
         - name: 构建源码
           script: pnpm run build
-        # 用当前仓库构建出来的 bin-linker 取代 npm 上的版本
+        # 全局装一份 miniprogram-ci，再用仓库构建出的 bin-linker 链接它；
+        # 全局 bin 目录以 npm prefix/bin 为准，保证 bin-linker 的探测与 pnpm 的实际落点一致
+        - name: 全局安装 miniprogram-ci
+          script: |
+            pnpm add -g miniprogram-ci
+            npm config set prefix "$(dirname "$(pnpm bin -g)")" --location=global
+            pnpm bin -g
         - name: 链接 miniprogram-ci
           script: node ./lib/index.mjs miniprogram-ci
         - name: 验证链接结果
