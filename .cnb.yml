@@ -1,0 +1,18 @@
+version: '1.0'
+patch:
+  push:
+    deploy:
+      docker:
+        image: airkro/node-lts:mp-wechat-ci
+        volumes:
+          - ${CNB_BRANCH}:/workspace/.pnpm-store:copy-on-write
+          - ${CNB_BRANCH}:/workspace/node_modules:copy-on-write
+      stages:
+        - name: 安装
+          script: |
+            pnpm i bin-linker
+            pnpm i -g moment
+        - name: 链接依赖
+          script: na exec bin-linker miniprogram-ci
+        - name: 测试
+          script: na exec miniprogram-ci -v
