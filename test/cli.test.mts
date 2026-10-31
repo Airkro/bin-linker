@@ -86,6 +86,21 @@ describe('cli', () => {
     expect(mocks.info).toHaveBeenCalledTimes(1);
   });
 
+  it('fails when the pnpm global bin directory is missing from PATH', async () => {
+    process.argv = ['node', 'bin-linker', 'tool'];
+    mocks.linkPackageBins.mockResolvedValue({
+      results: [
+        { pkg: 'tool', commands: [], globalBinDir: true },
+        { pkg: 'other', commands: ['other'] },
+      ],
+    });
+
+    await expect(run()).resolves.toBe(1);
+    expect(mocks.warn).toHaveBeenCalledWith(
+      expect.stringContaining('无法定位'),
+    );
+  });
+
   it('reports permission, missing-path, and unknown failures', async () => {
     process.argv = ['node', 'bin-linker', 'tool'];
     for (const error of [

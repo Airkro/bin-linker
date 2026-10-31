@@ -44,14 +44,13 @@ export function getPnpmHome(platform = process.platform): string {
 export const pnpmGlobalRoot = path.join(getPnpmHome(), 'global');
 
 /**
- * pnpm 11 checks that its global bin directory is in PATH even for `root -g`.
- * Temporarily add the likely pnpm home/bin locations so the query remains
- * compatible with pnpm 10 and pnpm 11, then restore the caller's environment.
+ * pnpm 10 / pnpm 11 都会校验全局 bin 目录是否在 PATH，否则连 `root -g` 也报错。
+ * 查询时临时把 pnpm 的相关目录补进 PATH，结束后恢复调用方的环境变量。
  *
- * 返回 `pnpm root -g` 的全局根目录；查询失败（pnpm 不可用或不在 PATH）时
- * 返回 null，由调用方回退到遍历 `<pnpmHome>/global` 自行查找。
+ * 返回 `pnpm root -g` 的全局根目录；查询失败（pnpm 不在 PATH 或校验不通过）
+ * 时返回 null，由调用方回退到遍历 `<pnpmHome>/global` 自行查找。
  */
-function getPnpmGlobalPath(): string | null {
+export function getPnpmGlobalPath(): string | null {
   const {
     PATH: originalPath,
     npm_config_global_bin_dir: globalBinDir,
@@ -95,7 +94,45 @@ function getPnpmGlobalPath(): string | null {
   }
 }
 
-export const pnpmGlobalPath = getPnpmGlobalPath();
+/**
+ * 收集候选的全局根目录。
+ *
+ * `pnpm root -g` 在 pnpm 10 下对全局 bin 目录不在 PATH 时会直接失败，
+ * 而 pnpm 10 的全局布局是 `<pnpmHome>/global/<ver>/node_modules`；
+ * pnpm 11 的全局根则统一为 `<pnpmHome>/global/v11`。
+ * 因此探测失败时按版本号从高到低推断候选根目录。
+ */
+function getPnpmGlobalCandidates(): string[] {
+  const versionDirs = ['v11', '10', '9', '8', '7', '6', '5'].map((version) =>
+    path.join(pnpmGlobalRoot, version),
+  );
+
+  const detected = getPnpmGlobalPath();
+
+  return [...new Set([detected, ...versionDirs])].filter((dir): dir is string =>
+    Boolean(dir),
+  );
+}
+
+/**
+ * 判断 pnpm 的全局 bin 目录是否不在 PATH 中。
+ *
+ * pnpm 10 起（pnpm 10 校验 `PNPM_HOME`，pnpm 11 校验 `PNPM_HOME/bin`），
+ * bin 目录不在 PATH 时 `pnpm i -g` 与 `pnpm root -g` 都会直接报错，
+ * 全局包实际上可能已装好，只是无法通过 pnpm 查询到。
+ */
+export function isPnpmBinDirMissingFromPath(): boolean {
+  const { PATH: pathEnv, npm_config_global_bin_dir: globalBinDir } =
+    process.env;
+  const configuredBinDir = globalBinDir || getPnpmHome();
+  const pathEntries = (pathEnv ?? '')
+    .split(path.delimiter)
+    .map((entry) => path.resolve(entry || '.'));
+
+  return ![configuredBinDir, path.join(configuredBinDir, 'bin')].some((dir) =>
+    pathEntries.includes(path.resolve(dir)),
+  );
+}
 
 export function getSymlinkType(
   platform = process.platform,
@@ -192,9 +229,11 @@ async function resolveInVersionDir(
  * 以兼容 pnpm 10 与 pnpm 11，找不到包时返回 null。
  */
 export async function resolveGlobalPkgDir(pkg: string): Promise<string | null> {
-  // 优先使用 `pnpm root -g` 的结果（当前 pnpm 版本的全局根目录）。
-  // 查找 pnpm 10 / pnpm 11 两种布局，命中即返回。
-  if (pnpmGlobalPath) {
+  const pnpmGlobalPaths = getPnpmGlobalCandidates();
+
+  // 优先使用 `pnpm root -g` 的结果（当前 pnpm 版本的全局根目录），
+  // 其次是推断出的版本目录。查找 pnpm 10 / pnpm 11 两种布局，命中即返回。
+  for (const pnpmGlobalPath of pnpmGlobalPaths) {
     const found = await resolveInVersionDir(pnpmGlobalPath, pkg);
 
     if (found) {
@@ -210,7 +249,7 @@ export async function resolveGlobalPkgDir(pkg: string): Promise<string | null> {
   for (const entry of versionDirs) {
     const root = path.join(pnpmGlobalRoot, entry);
 
-    if (root !== pnpmGlobalPath) {
+    if (!pnpmGlobalPaths.includes(root)) {
       const resolved = await resolveInVersionDir(root, pkg);
 
       if (resolved) {

@@ -4,6 +4,7 @@ import path from 'node:path';
 const mocks = vi.hoisted(() => ({
   createSymlink: vi.fn(),
   ensureDir: vi.fn(),
+  isPnpmBinDirMissingFromPath: vi.fn(() => false),
   isWindows: true,
   readPackageJson: vi.fn(),
   resolveGlobalPkgDir: vi.fn(),
@@ -17,6 +18,7 @@ vi.mock('../src/fs.mts', () => ({
   get isWindows() {
     return mocks.isWindows;
   },
+  isPnpmBinDirMissingFromPath: mocks.isPnpmBinDirMissingFromPath,
   localBinDir: '/project/node_modules/.bin',
   pnpmGlobalPath: '/global/node_modules',
   readPackageJson: mocks.readPackageJson,
@@ -35,6 +37,7 @@ describe('linkPackageBins', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     mocks.isWindows = true;
+    mocks.isPnpmBinDirMissingFromPath.mockReturnValue(false);
     mocks.ensureDir.mockResolvedValue(true);
     mocks.unlink.mockRejectedValue({ code: 'ENOENT' });
     mocks.symlink.mockResolvedValue(undefined);
@@ -73,6 +76,17 @@ describe('linkPackageBins', () => {
       results: [{ pkg: 'ghost', commands: [], notFound: true }],
     });
     expect(mocks.readPackageJson).not.toHaveBeenCalled();
+  });
+
+  it('blames the missing global bin directory before reporting not found', async () => {
+    // pnpm 的全局 bin 目录不在 PATH 时，pnpm 自身的全局目录查询也会失效，
+    // 此时报「找不到包」会误导用户，应提示先配置 pnpm 全局 bin 目录。
+    mocks.resolveGlobalPkgDir.mockResolvedValue(null);
+    mocks.isPnpmBinDirMissingFromPath.mockReturnValue(true);
+
+    await expect(linkPackageBins(['ghost'])).resolves.toEqual({
+      results: [{ pkg: 'ghost', commands: [], globalBinDir: true }],
+    });
   });
 
   it('links all binaries and records individual failures', async () => {

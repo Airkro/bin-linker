@@ -153,22 +153,31 @@ describe('filesystem helpers', () => {
     // isDirectory 调用顺序：
     // 1. 当前根 global/v11/tool 直接布局未命中
     // 2. 当前根 global/v11/node_modules/tool 未命中
-    // 3. 版本目录 global/5 的直接布局（global/5/tool）未命中
-    // 4. 版本目录 global/5 的 node_modules 子目录布局（global/5/node_modules/tool）命中
+    // 3~16. 推断候选根目录 global/10、9、8、7、6 的两种布局均未命中
+    // 17. 候选根目录 global/5 的直接布局（global/5/tool）未命中
+    // 18. 候选根目录 global/5 的 node_modules 子目录（global/5/node_modules/tool）命中
+    mocks.stat.mockRejectedValue(new Error('missing'));
     mocks.stat
       .mockRejectedValueOnce(new Error('not at root'))
       .mockRejectedValueOnce(new Error('no node_modules subdir'))
+      .mockRejectedValueOnce(new Error('not at 10'))
+      .mockRejectedValueOnce(new Error('no node_modules subdir'))
+      .mockRejectedValueOnce(new Error('not at 9'))
+      .mockRejectedValueOnce(new Error('no node_modules subdir'))
+      .mockRejectedValueOnce(new Error('not at 8'))
+      .mockRejectedValueOnce(new Error('no node_modules subdir'))
+      .mockRejectedValueOnce(new Error('not at 7'))
+      .mockRejectedValueOnce(new Error('no node_modules subdir'))
+      .mockRejectedValueOnce(new Error('not at 6'))
+      .mockRejectedValueOnce(new Error('no node_modules subdir'))
       .mockRejectedValueOnce(new Error('not in version root'))
       .mockResolvedValueOnce(isDir);
-    // readdir 调用顺序：
-    // 1. 读当前根 global/v11 的虚拟目录（无结果）
-    // 2. 读 <pnpmHome>/global 版本目录列表
-    mocks.readdir.mockResolvedValueOnce([]).mockResolvedValueOnce(['5', 'v11']);
+    // readdir 调用顺序：读当前根 global/v11 的虚拟目录（无结果）等各候选根目录
+    mocks.readdir.mockResolvedValue([]);
 
     await expect(ciFs.resolveGlobalPkgDir('tool')).resolves.toBe(
       path.join(globalRoot, '5', 'node_modules', 'tool'),
     );
-    expect(mocks.readdir).toHaveBeenCalledWith(globalRoot);
 
     mocks.execSync.mockReturnValue('/global/node_modules\n');
     vi.resetModules();
@@ -189,11 +198,9 @@ describe('filesystem helpers', () => {
 
     // @ts-expect-error Vitest supports query strings for isolated module imports.
     const sameRootFs = await import('../src/fs.mts?same-global-root');
-    // 直接布局与 node_modules 子目录布局均未命中（跳过 pnpm 10 两种布局）
-    mocks.stat
-      .mockRejectedValueOnce(new Error('missing'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'));
-    mocks.readdir.mockResolvedValueOnce([]).mockResolvedValueOnce(['.']);
+    // 所有候选根目录（当前根与推断版本目录）的两种布局均未命中
+    mocks.stat.mockRejectedValue(new Error('missing'));
+    mocks.readdir.mockResolvedValue([]);
 
     await expect(sameRootFs.resolveGlobalPkgDir('ghost')).resolves.toBeNull();
     expect(mocks.readdir).toHaveBeenCalledWith(sameRootFs.pnpmGlobalRoot);
@@ -216,21 +223,31 @@ describe('filesystem helpers', () => {
     const globalRoot = pnpmGlobalRoot;
     // isDirectory 调用顺序：
     // 1. 当前全局根目录的直接布局（/global/node_modules/tool）未命中
-    // 2. 当前全局根目录的 node_modules 子目录布局（/global/node_modules/node_modules/tool）未命中
-    // 3. 版本目录 global/5 的直接命中（global/5/tool）命中
+    // 2. 当前全局根目录的 node_modules 子目录布局未命中
+    // 当前全局根目录与推断候选根目录 global/v11 … global/6 均未命中，
+    // 最后候选根目录 global/5 的直接布局（global/5/tool）命中
+    mocks.stat.mockRejectedValue(new Error('missing'));
     mocks.stat
-      .mockRejectedValueOnce(new Error('not in current'))
+      .mockRejectedValueOnce(new Error('not at root'))
+      .mockRejectedValueOnce(new Error('no node_modules subdir'))
+      .mockRejectedValueOnce(new Error('not at v11'))
+      .mockRejectedValueOnce(new Error('no node_modules subdir'))
+      .mockRejectedValueOnce(new Error('not at 10'))
+      .mockRejectedValueOnce(new Error('no node_modules subdir'))
+      .mockRejectedValueOnce(new Error('not at 9'))
+      .mockRejectedValueOnce(new Error('no node_modules subdir'))
+      .mockRejectedValueOnce(new Error('not at 8'))
+      .mockRejectedValueOnce(new Error('no node_modules subdir'))
+      .mockRejectedValueOnce(new Error('not at 7'))
+      .mockRejectedValueOnce(new Error('no node_modules subdir'))
+      .mockRejectedValueOnce(new Error('not at 6'))
       .mockRejectedValueOnce(new Error('no node_modules subdir'))
       .mockResolvedValueOnce(isDir);
-    // readdir 调用顺序：
-    // 1. 读当前全局根目录的虚拟目录（无结果）
-    // 2. 读 <pnpmHome>/global 版本目录列表
-    mocks.readdir.mockResolvedValueOnce([]).mockResolvedValueOnce(['5', 'v11']);
+    mocks.readdir.mockResolvedValue([]);
 
     await expect(resolveGlobalPkgDir('tool')).resolves.toBe(
       path.join(globalRoot, '5', 'tool'),
     );
-    expect(mocks.readdir).toHaveBeenCalledWith(globalRoot);
   });
 
   it('creates symlinks and handles target and unlink errors', async () => {
@@ -364,7 +381,7 @@ describe('filesystem helpers', () => {
     // @ts-expect-error Vitest supports query strings for isolated module imports.
     const warningFs = await import('../src/fs.mts?pnpm-warning');
 
-    expect(warningFs.pnpmGlobalPath).toBe('/pnpm/global/v11/node_modules');
+    expect(warningFs.getPnpmGlobalPath()).toBe('/pnpm/global/v11/node_modules');
   });
 
   it('falls back to trimmed pnpm output when no absolute path is present', async () => {
@@ -374,7 +391,7 @@ describe('filesystem helpers', () => {
     // @ts-expect-error Vitest supports query strings for isolated module imports.
     const fallbackFs = await import('../src/fs.mts?pnpm-root-fallback');
 
-    expect(fallbackFs.pnpmGlobalPath).toBe('global root unavailable');
+    expect(fallbackFs.getPnpmGlobalPath()).toBe('global root unavailable');
   });
 
   it('falls back to scanning the global root when `pnpm root -g` fails', async () => {
@@ -392,19 +409,17 @@ describe('filesystem helpers', () => {
       // @ts-expect-error Vitest supports query strings for isolated module imports.
       const failedFs = await import('../src/fs.mts?pnpm-root-failed');
 
-      expect(failedFs.pnpmGlobalPath).toBeNull();
+      expect(failedFs.getPnpmGlobalPath()).toBeNull();
       expect(failedFs.pnpmGlobalRoot).toBe(path.join('/pnpm-home', 'global'));
 
-      // 兜底查找：当前无全局根目录可用，直接遍历 <pnpmHome>/global 下版本目录，
-      // 首个版本目录 `5` 的直接布局命中。
+      // 兜底查找：探测失败时按版本号从高到低推断候选根目录（global/v11、
+      // global/10 … global/5），首个命中的是推断出的 global/v11 直接布局。
       const globalRoot = path.join('/pnpm-home', 'global');
       mocks.stat.mockResolvedValueOnce(isDir);
-      mocks.readdir.mockResolvedValueOnce(['5', 'v11']);
 
       await expect(failedFs.resolveGlobalPkgDir('tool')).resolves.toBe(
-        path.join(globalRoot, '5', 'tool'),
+        path.join(globalRoot, 'v11', 'tool'),
       );
-      expect(mocks.readdir).toHaveBeenCalledWith(globalRoot);
     } finally {
       if (originalPnpmHome === undefined) {
         delete process.env.PNPM_HOME;

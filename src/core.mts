@@ -4,6 +4,7 @@ import { promises as fs } from 'node:fs';
 import {
   createSymlink,
   ensureDir,
+  isPnpmBinDirMissingFromPath,
   isWindows,
   localBinDir,
   readPackageJson,
@@ -17,6 +18,7 @@ type PkgResult = {
   commands?: string[];
   notFound?: boolean;
   noBin?: boolean;
+  globalBinDir?: boolean;
   errors?: PkgError[];
 };
 
@@ -82,6 +84,12 @@ async function linkPackageBin(pkg: string): Promise<PkgResult> {
   const pkgDir = await resolveGlobalPkgDir(pkg);
 
   if (!pkgDir) {
+    // 全局 bin 目录不在 PATH 时 pnpm 自身的全局目录查询会失效，
+    // 此时多半是把「环境没配好」误报成「包没安装」，需要区分提示。
+    if (isPnpmBinDirMissingFromPath()) {
+      return { pkg, commands: [], globalBinDir: true };
+    }
+
     return { pkg, commands: [], notFound: true };
   }
 

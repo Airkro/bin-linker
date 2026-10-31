@@ -49,14 +49,21 @@ function showResults({
     commands?: string[];
     notFound?: boolean;
     noBin?: boolean;
+    globalBinDir?: boolean;
     errors?: Array<{ name: string; error: Error }>;
   }>;
 }): number {
   let linkedCount = 0;
+  const hasGlobalBinDirIssue = results.some(({ globalBinDir }) => globalBinDir);
 
   results.forEach((pkgResult) => {
     if (pkgResult.notFound) {
       log.warn(`找不到包: ${fmt.pkg(pkgResult.pkg)}`);
+    } else if (pkgResult.globalBinDir) {
+      log.warn(`无法定位 ${fmt.pkg(pkgResult.pkg)} 的全局安装目录`);
+      log.info(
+        `请先把 pnpm 的全局 bin 目录加入 PATH: ${fmt.cmd('pnpm setup')}`,
+      );
     } else if (pkgResult.noBin) {
       log.warn(`包 ${fmt.pkg(pkgResult.pkg)} 没有可执行文件`);
     } else if ((pkgResult.commands?.length ?? 0) > 0) {
@@ -78,6 +85,10 @@ function showResults({
     log.warn('没有链接任何命令');
   } else if (results.length > 1) {
     log.info(`共链接了 ${linkedCount} 个命令`);
+  }
+
+  if (hasGlobalBinDirIssue) {
+    return 1;
   }
 
   return linkedCount ? 0 : 1;
