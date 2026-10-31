@@ -183,3 +183,6 @@ $RECYCLE.BIN/
 # End of https://gitignore.io/api/ssh,certificates,node,windows
 
 lib/*
+
+### pnpm ###
+.pnpm-store/

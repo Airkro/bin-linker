@@ -1,18 +1,34 @@
 version: '1.0'
+
 patch:
   push:
-    deploy:
+    # 原有环境镜像已失效，改用官方镜像还原 dockerfile 里的 pnpm 环境
+    - name: 构建与测试
+      runner:
+        tags:
+          - cnb:arch:amd64
       docker:
-        image: airkro/node-lts:mp-wechat-ci
+        image: node:lts-alpine
         volumes:
           - ${CNB_BRANCH}:/workspace/.pnpm-store:copy-on-write
           - ${CNB_BRANCH}:/workspace/node_modules:copy-on-write
+      env:
+        XDG_DATA_HOME: /home/.share
+        PNPM_HOME: /home/.share/pnpm
+        PATH: /home/.share/pnpm:$PATH
       stages:
-        - name: 安装1
-          script: pnpm i bin-linker
-        - name: 安装2
-          script: pnpm i -g moment
-        - name: 链接依赖
-          script: na exec bin-linker miniprogram-ci
-        - name: 测试
-          script: na exec miniprogram-ci -v
+        - name: 预热 pnpm
+          script: |
+            pnpm config set store-dir /workspace/.pnpm-store --global
+            pnpm root -g
+        - name: 安装依赖
+          script: pnpm i --ignore-scripts
+        - name: 类型检查
+          script: pnpm run lint:type
+        - name: 构建源码
+          script: pnpm run build
+        # 用当前仓库构建出来的 bin-linker 取代 npm 上的版本
+        - name: 链接 miniprogram-ci
+          script: node ./lib/index.mjs miniprogram-ci
+        - name: 验证链接结果
+          script: npx --no miniprogram-ci -v
