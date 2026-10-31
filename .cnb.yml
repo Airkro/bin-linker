@@ -8,10 +8,10 @@ patch:
           - ${CNB_BRANCH}:/workspace/.pnpm-store:copy-on-write
           - ${CNB_BRANCH}:/workspace/node_modules:copy-on-write
       stages:
-        - name: 安装
-          script: |
-            pnpm i bin-linker
-            pnpm i -g moment
+        - name: 安装1
+          script: pnpm i bin-linker
+        - name: 安装2
+          script: pnpm i -g moment
         - name: 链接依赖
           script: na exec bin-linker miniprogram-ci
         - name: 测试
