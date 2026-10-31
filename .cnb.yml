@@ -9,23 +9,24 @@ patch:
           - cnb:arch:amd64
       docker:
         image: node:lts-alpine
-      # pnpm 的全局目录、全局 bin 与 store 都放在工作区之外，
-      # 才能用下面带 cache 的 volumes 在构建间保留。
-      # 注意 docker.volumes 里的 path 就是容器内挂载点，
-      # 与流水线挂入的 /workspace 互为包含时容器起不来，所以缓存一律走 stage 级 volumes。
+        # 数据卷只能在这里声明（stage / job 没有 volumes 配置项）。
+        # path 即容器内挂载点，不能与流水线挂入的 /workspace 互为包含，
+        # 所以 pnpm 的 store 与全局目录都放在 /home/.share 下。
+        volumes:
+          - /home/.share/pnpm:copy-on-write
+      # 不能用 $PATH 拼接：声明在 env 里的 PATH 会先参与变量替换，
+      # 此时 $PATH 还是空的，冒号后的内容会被当成命令执行。
       env:
         XDG_DATA_HOME: /home/.share
         PNPM_HOME: /home/.share/pnpm
-        PATH: /home/.share/pnpm/bin:/home/.share/pnpm:$PATH
+        PATH: /home/.share/pnpm/bin:/home/.share/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       stages:
         - name: 预热 pnpm
           script: |
-            pnpm config set storeDir /home/.share/pnpm/store --global
+            pnpm config set store-dir /home/.share/pnpm/store --global
             pnpm root -g
         - name: 安装依赖
           script: pnpm i --ignore-scripts
-          volumes:
-            - /home/.share/pnpm
         - name: 类型检查
           script: pnpm run lint:type
         - name: 构建源码
@@ -33,8 +34,6 @@ patch:
         # 全局装一份 miniprogram-ci，再用仓库构建出的 bin-linker 链接它
         - name: 全局安装 miniprogram-ci
           script: pnpm add -g miniprogram-ci
-          volumes:
-            - /home/.share/pnpm
         - name: 链接 miniprogram-ci
           script: node ./lib/index.mjs miniprogram-ci
         - name: 验证链接结果
