@@ -12,9 +12,9 @@ import {
 } from './fs.mts';
 import {
   isPnpmBinDirMissingFromPath,
-  normalizePkgName,
   resolveGlobalDepotDir,
   resolveGlobalPkgDirs,
+  toPkgName,
 } from './pnpm.mts';
 
 export type PkgResult = {
@@ -32,11 +32,10 @@ export type PkgResult = {
   depsLinked?: boolean;
 };
 
+type BinEntries = Array<[name: string, relPath: string]>;
+
 /** `bin` 是字符串时命令名取包名（去掉 scope 前缀） */
-function getBinEntries(
-  pkg: string,
-  bin: PackageMeta['bin'],
-): Array<[string, string]> {
+function getBinEntries(pkg: string, bin: PackageMeta['bin']): BinEntries {
   if (typeof bin === 'string') {
     return [[pkg.split('/').at(-1) as string, bin]];
   }
@@ -59,58 +58,6 @@ async function readDirNames(dir: string): Promise<Set<string>> {
 }
 
 /**
- * 链接是否已经指向 target（且真的存在）。
- *
- * 先 `realpath` 再 `readlink`，只在「解析结果对上」之后才确认链接本身还在
- * （`readlink` 对普通目录也会失败，正好说明它不是链接）。链接已就位是常态
- * （重跑、`pnpm <cmd>` 前置钩子），两个 syscall 就收工。
- */
-async function linkPointsTo(link: string, target: string): Promise<boolean> {
-  // 不存在、或压根不是链接（普通目录会 EINVAL）：都算「要重建」
-  try {
-    await fs.readlink(link);
-  } catch {
-    return false;
-  }
-
-  const realLink = await fs.realpath(link).catch(() => null);
-
-  // 包路径解析不到就按原路径比
-  const realTarget = await fs.realpath(target).catch(() => target);
-
-  return realLink === realTarget;
-}
-
-/** 把全局包链进工程的 `node_modules`，让运行时能按包名找到它 */
-async function linkPackage(pkgDirs: string[], pkg: string): Promise<void> {
-  const link = path.join(process.cwd(), 'node_modules', pkg);
-
-  try {
-    await ensureDir(path.dirname(link));
-
-    // 已经指对了就别动：原来每次都 unlink + symlink，重跑等于把所有链接重建一遍，
-    // 还会让链接短暂消失（`pnpm <cmd>`、`npx` 这类前置钩子里跑一次尤其浪费）
-    for (const pkgDir of pkgDirs) {
-      if (await linkPointsTo(link, pkgDir)) {
-        return;
-      }
-    }
-
-    // 多个安装位置取第一份（版本目录按新到旧，优先最近装的那个）
-    await fs.unlink(link).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== 'ENOENT') {
-        throw error;
-      }
-    });
-    await fs.symlink(pkgDirs[0] as string, link, getLinkType());
-  } catch (error) {
-    // 包链接失败只影响这一个包，按包记账即可；Windows 的 EPERM 要靠管理员权限解决，
-    // 混进「这个包链接失败」里没人看得懂，交给 CLI 统一提示。
-    throw rethrowPermissions(error);
-  }
-}
-
-/**
  * 把包自己解析不到的依赖补进它的 `node_modules`。
  *
  * pnpm 全局安装把真实包放在 store 里，依赖平铺在全局安装根的 `.pnpm/node_modules`。
@@ -120,16 +67,12 @@ async function linkPackage(pkgDirs: string[], pkg: string): Promise<void> {
  * 的解析方式一致。
  *
  * 「缺哪些」只付一次 readdir：依赖表里列出来的就是这一版 pnpm 认为这个包该看得到的
- * 全部依赖，表里有、包里没有，就是缺。早前是逐依赖 `createRequire().resolve()`，
- * 每个都要走一遍 node 的解析算法（含读 package.json），只为回答一个 lstat 就能回答的问题。
+ * 全部依赖，表里有、包里没有，就是缺。
  *
  * 返回是否真的补上了东西；补不上不算错误，命令链接已经建好，缺哪个依赖交给运行时照实报错。
  */
-export async function linkMissingDeps(
-  pkgDir: string,
-  entry: string | undefined,
-): Promise<boolean> {
-  const depotDir = entry && (await resolveGlobalDepotDir());
+export async function linkMissingDeps(pkgDir: string): Promise<boolean> {
+  const depotDir = await resolveGlobalDepotDir();
 
   if (!depotDir) {
     return false;
@@ -149,7 +92,10 @@ export async function linkMissingDeps(
 
   for (const dep of todo) {
     try {
-      await ensureDir(depsNodeModules);
+      if (!(await ensureDir(depsNodeModules))) {
+        return linked;
+      }
+
       // 依赖目录也是 store 里的真实目录，Windows 上与包本体一样用 junction
       await fs.symlink(
         path.join(depotDir, dep),
@@ -170,11 +116,9 @@ export async function linkMissingDeps(
  *
  * 同一个包可能同时留在好几个版本目录里（旧版本没清），指向 store 的软链也可能已经断了。
  * 读不到元数据就换下一个候选——早前是先挑第一个路径再去读，读不到直接报「找不到包」，
- * 明明后面还排着一份好的。读到的元数据直接带下去用，不再读第二遍。
+ * 明明后面还排着一份好的。
  */
-async function pickPackage(
-  pkgDirs: string[],
-): Promise<{ pkgDir: string; pkgJson: PackageMeta | null } | null> {
+async function pickPackage(pkgDirs: string[]) {
   for (const pkgDir of pkgDirs) {
     const pkgJson = await readPackageJson(pkgDir);
 
@@ -189,17 +133,16 @@ async function pickPackage(
 /** 把可执行文件逐个链进工程的 `node_modules/.bin`；某个失败不影响其余命令 */
 async function linkBinEntries(
   pkgDir: string,
-  binEntries: Array<[string, string]>,
-): Promise<{ commands: string[]; errors: PkgResult['errors'] }> {
+  binEntries: BinEntries,
+): Promise<{ commands: string[]; errors: NonNullable<PkgResult['errors']> }> {
   const commands: string[] = [];
   const errors: NonNullable<PkgResult['errors']> = [];
 
   for (const [name, relPath] of binEntries) {
     try {
-      await createSymlink(
+      await createSymlink(path.join(localBinDir, name), [
         path.join(pkgDir, relPath),
-        path.join(localBinDir, name),
-      );
+      ]);
       commands.push(name);
     } catch (error) {
       errors.push({ name, error: rethrowPermissions(error) });
@@ -209,9 +152,9 @@ async function linkBinEntries(
   return { commands, errors };
 }
 
-async function linkPackageBin(name: string): Promise<PkgResult> {
-  const pkg = normalizePkgName(name);
-  const pkgDirs = await resolveGlobalPkgDirs(name);
+async function linkPackageBin(input: string): Promise<PkgResult> {
+  const pkg = toPkgName(input);
+  const pkgDirs = await resolveGlobalPkgDirs(pkg);
 
   if (pkgDirs.length === 0) {
     // 全局 bin 目录不在 PATH 时 pnpm 自身的全局目录查询会失效，
@@ -228,21 +171,25 @@ async function linkPackageBin(name: string): Promise<PkgResult> {
   }
 
   const { pkgDir, pkgJson } = picked;
-  const binEntries = getBinEntries(pkg, pkgJson?.bin);
+  const binEntries = getBinEntries(pkg, pkgJson.bin);
 
-  try {
-    await linkPackage(pkgDirs, pkg);
-  } catch (error) {
-    return { pkg, errors: [{ name: pkg, error: error as Error }] };
-  }
-
+  // 没有 bin 的包连本体都不用链：它只提供库，工程里用不着它
   if (binEntries.length === 0) {
     return { pkg, noBin: true };
   }
 
+  try {
+    // 多个安装位置取第一份（按新到旧，优先最近装的那个）
+    await createSymlink(path.join(process.cwd(), 'node_modules', pkg), pkgDirs);
+  } catch (error) {
+    // 包链接失败只影响这一个包，按包记账即可；Windows 的 EPERM 要靠管理员权限解决，
+    // 混进「这个包链接失败」里没人看得懂，交给 CLI 统一提示。
+    throw rethrowPermissions(error);
+  }
+
   // 补依赖与建命令链接互不相干，并行：补依赖要读 store 那张表，动辄几十个 syscall
   const [depsLinked, { commands, errors }] = await Promise.all([
-    linkMissingDeps(pkgDir, binEntries[0]?.[1]).catch(() => false),
+    linkMissingDeps(pkgDir).catch(() => false),
     linkBinEntries(pkgDir, binEntries),
   ]);
 

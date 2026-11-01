@@ -35,18 +35,8 @@ export async function ensureDir(dir: string): Promise<boolean> {
   }
 }
 
-/** 建软链，覆盖已有的那一份 */
-export async function createSymlink(
-  target: string,
-  link: string,
-): Promise<boolean> {
-  // 已经指着同一个目标就跳过：命令链接在重跑、`pnpm <cmd>` 前置钩子里是常态，
-  // 而 unlink + symlink 是两次写操作，还会让链接短暂消失
-  if ((await fs.readlink(link).catch(() => null)) === target) {
-    return true;
-  }
-
-  // 不存在的链接当它已经删掉了
+/** 不存在的链接当它已经删掉了 */
+async function unlinkIfPresent(link: string): Promise<void> {
   try {
     await fs.unlink(link);
   } catch (error) {
@@ -54,8 +44,60 @@ export async function createSymlink(
       throw error;
     }
   }
+}
 
-  await fs.symlink(target, link, getLinkType(target));
+/** 目标那一侧解析不到就按字面路径比：断掉的 store 链接不该让判定整段失效 */
+async function resolveTargets(targets: string[]): Promise<string[]> {
+  return Promise.all(
+    targets.map((target) => fs.realpath(target).catch(() => target)),
+  );
+}
+
+/**
+ * 链接是否已经指着 `targets` 里的某一份。
+ *
+ * 先 `readlink` 确认它是个链接（普通目录会 EINVAL，也算要重建），再 `realpath`
+ * 确认它没断：两边都解析不到就退回字面路径去比，一个指向同一路径的空壳会正好对得上，
+ * 于是永远不重建。所以链接那一侧解析失败时一律判否。
+ */
+async function linkPointsTo(link: string, targets: string[]): Promise<boolean> {
+  const current = await fs.readlink(link).catch(() => null);
+
+  // 不存在、或压根不是链接（普通目录会 EINVAL）：都算「要重建」
+  if (!current) {
+    return false;
+  }
+
+  // 字面路径对得上就不用再问文件系统（重跑时最常见的那条路）
+  if (targets.includes(current)) {
+    return true;
+  }
+
+  // 解析不到就说明这是个空壳（目标已经没了），别拿字面路径去比——那样正好对得上，永远不重建
+  const realLink = await fs.realpath(link).catch(() => current);
+  const realTargets = await resolveTargets(targets);
+
+  return realTargets.includes(realLink);
+}
+
+/**
+ * 把 `link` 指向 `targets` 里第一个能用的那一份，已经指着其中任意一份就跳过。
+ *
+ * `targets` 是同一个东西的多个候选安装位置（包可能同时留在几个版本目录里），
+ * 判定与写入都只在这一处，别处不要再自己读一遍链接。
+ */
+export async function createSymlink(
+  link: string,
+  targets: string[],
+): Promise<boolean> {
+  // 重跑、`pnpm <cmd>` 前置钩子里链接已就位是常态，而 unlink + symlink 是两次写操作，
+  // 还会让链接短暂消失
+  if (await linkPointsTo(link, targets)) {
+    return true;
+  }
+
+  await unlinkIfPresent(link);
+  await fs.symlink(targets[0] as string, link, getLinkType(targets[0]));
 
   return true;
 }
@@ -63,7 +105,6 @@ export async function createSymlink(
 /** package.json 里用得着的那几个字段 */
 export type PackageMeta = {
   bin?: string | Record<string, string>;
-  main?: string;
 };
 
 /** 读取包的 package.json，读不到或内容无效时返回 null */

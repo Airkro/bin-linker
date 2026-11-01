@@ -37,45 +37,49 @@ describe('cli', () => {
     process.argv = ['node', 'bin-linker'];
   });
 
-  it('dedupes repeated packages and strips the working directory', async () => {
-    // 同一个包写两遍只该链一次；脚本里常传 $(pwd)/node_modules/xxx 这种绝对路径，
-    // node_modules 的位置按包名拼，绝对路径会解析不到，得先在工程内还原成相对路径。
+  it('normalizes packages before deduplicating them', async () => {
+    // 同一个包写三遍只该链一次；脚本里常传 $(pwd)/node_modules/xxx 这种绝对路径，
+    // node_modules 的位置按包名拼，带路径会解析不到。
     process.argv = [
       'node',
       'bin-linker',
       'tool',
       'tool',
       `${process.cwd()}/node_modules/tool`,
-      '/elsewhere/other-pkg',
+      `${process.cwd()}/node_modules/@scope/tool`,
+      '/elsewhere/node_modules/tool',
     ];
-    mocks.linkPackageBins.mockResolvedValue({ results: [] });
 
-    await run();
+    await runWith([]);
 
-    expect(mocks.linkPackageBins).toHaveBeenCalledWith([
-      'tool',
-      'node_modules/tool',
-      '/elsewhere/other-pkg',
-    ]);
+    expect(mocks.linkPackageBins).toHaveBeenCalledWith(['tool', '@scope/tool']);
   });
 
-  it('shows usage when no packages are supplied', async () => {
-    await expect(run()).resolves.toBe(0);
+  it('keeps a bare scope name as it is', async () => {
+    process.argv = ['node', 'bin-linker', './node_modules/@scope'];
+
+    await runWith([]);
+
+    expect(mocks.linkPackageBins).toHaveBeenCalledWith(['@scope']);
+  });
+
+  it('shows usage and fails when no packages are supplied', async () => {
+    // 没说要链什么就直接给用法，退出码 1：这不算成功
+    await expect(run()).resolves.toBe(1);
     expect(mocks.warn).toHaveBeenCalled();
     expect(mocks.linkPackageBins).not.toHaveBeenCalled();
   });
 
   it('filters options out of the package list', async () => {
     process.argv = ['node', 'bin-linker', '--help', 'missing', 'empty', 'tool'];
-    mocks.linkPackageBins.mockResolvedValue({
-      results: [
+
+    await expect(
+      runWith([
         { pkg: 'missing', notFound: true },
         { pkg: 'empty', noBin: true },
         { pkg: 'tool', commands: ['tool'] },
-      ],
-    });
-
-    await expect(run()).resolves.toBe(0);
+      ]),
+    ).resolves.toBe(0);
     expect(mocks.linkPackageBins).toHaveBeenCalledWith([
       'missing',
       'empty',

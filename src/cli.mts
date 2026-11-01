@@ -2,6 +2,7 @@ import { isAbsolute, relative } from 'node:path';
 
 import { linkPackageBins, type PkgResult } from './core.mts';
 import { fmt, log } from './output.mts';
+import { toPkgName } from './pnpm.mts';
 
 /** 处理错误并返回退出码 */
 function handleError(err: NodeJS.ErrnoException): number {
@@ -25,6 +26,20 @@ function handleError(err: NodeJS.ErrnoException): number {
   }
 
   return 1;
+}
+
+/**
+ * 把工程内的绝对路径还原成相对路径，再取包名。
+ *
+ * `node_modules` 的实际位置按包名拼，写成 `/…/node_modules/cowsay`
+ * （脚本里 `$(pwd)/node_modules/xxx` 就是这么来的）会解析不到。
+ * 工程外的绝对路径保持原样，别把它变成一串 `../..`，包名交给上一层取。
+ */
+function readArg(arg: string): string {
+  // Windows 上盘符大小写、大小写不敏感都可能让前缀比较失手，交给 relative 归一
+  const rel = isAbsolute(arg) ? relative(process.cwd(), arg) : arg;
+
+  return toPkgName(rel && !rel.startsWith('..') ? rel : arg);
 }
 
 /** 把单个包的结果写进日志，返回链接成功的命令数 */
@@ -69,33 +84,16 @@ function report(result: PkgResult): number {
   return commands.length;
 }
 
-/**
- * 把工程内的绝对路径还原成相对路径。
- *
- * `node_modules` 的实际位置按包名拼，写成 `/…/node_modules/cowsay`
- * （脚本里 `$(pwd)/node_modules/xxx` 就是这么来的）会解析不到。
- */
-function stripCwd(arg: string): string {
-  if (!isAbsolute(arg)) {
-    return arg;
-  }
-
-  // Windows 上盘符大小写、大小写不敏感都可能让 startsWith 失手，先归一
-  const rel = relative(process.cwd(), arg);
-
-  // 工程外的绝对路径保持原样，别把它变成一串 ../..
-  return rel && !rel.startsWith('..') ? rel : arg;
-}
-
 /** 链接 argv 里的包，把结果写进日志，并给出退出码 */
 export async function run(): Promise<number> {
-  // 同一个包写两遍只该链一次：重复跑一遍会把「已链接」播报两遍，命令数也跟着翻倍
+  // 归一放在去重之前：`cowsay cowsay $(pwd)/node_modules/cowsay` 是同一个包，
+  // 不归一就会被当成三个，播报两遍、命令数翻倍
   const packages = [
     ...new Set(
       process.argv
         .slice(2)
         .filter((arg) => !arg.startsWith('-'))
-        .map((arg) => stripCwd(arg)),
+        .map((arg) => readArg(arg)),
     ),
   ];
 
@@ -103,7 +101,7 @@ export async function run(): Promise<number> {
     log.warn('请指定要链接的包名');
     log.info('Usage: bin-linker <package-name> [<package-name>...]');
 
-    return 0;
+    return 1;
   }
 
   try {
