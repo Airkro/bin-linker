@@ -11,10 +11,9 @@ describe('fmt', () => {
     expect(fmt.list()).toBe('');
   });
 
-  it('formats package, command, and path values', () => {
+  it('formats package names and commands', () => {
     expect(fmt.pkg('package')).toContain('package');
     expect(fmt.cmd('command')).toContain('command');
-    expect(fmt.path('/tmp/package')).toContain('/tmp/package');
   });
 
   it('writes log messages at each level', () => {

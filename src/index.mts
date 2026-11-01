@@ -10,12 +10,6 @@ function fail(error: Error): void {
 process.on('uncaughtException', fail);
 process.on('unhandledRejection', fail);
 
-run().then(
-  (exitCode) => {
-    process.exitCode = exitCode;
-  },
-  (error: Error) => {
-    log.error(`执行失败: ${error.message}`);
-    process.exitCode = 1;
-  },
-);
+run().then((exitCode) => {
+  process.exitCode = exitCode;
+}, fail);

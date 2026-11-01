@@ -34,23 +34,44 @@ export function getPnpmHome(platform = process.platform): string {
   );
 }
 
+/** pnpm 10 起会校验的那个目录：全局 bin 目录本身与它下面的 `bin` */
+function globalBinDirs(): string[] {
+  const binDir = process.env.npm_config_global_bin_dir || getPnpmHome();
+
+  return [binDir, path.join(binDir, 'bin')];
+}
+
 /**
- * 查询全局根时临时补的环境变量，结束后原样还回去（原本没有的删掉）。
+ * 判断 pnpm 的全局 bin 目录是否不在 PATH 中。
  *
+ * pnpm 10 起 bin 目录不在 PATH 时 `pnpm i -g` 与 `pnpm root -g` 都会直接报错，
+ * 全局包实际上可能已装好，只是无法通过 pnpm 查询到。
+ */
+export function isBinDirMissingFromPath(): boolean {
+  const entries = new Set(
+    (process.env.PATH ?? '')
+      .split(path.delimiter)
+      .map((entry) => path.resolve(entry || '.')),
+  );
+
+  return globalBinDirs().every((dir) => !entries.has(path.resolve(dir)));
+}
+
+/**
+ * 借一份临时的环境跑一件事，结束后原样还回去（原本没有的删掉）。
+ *
+ * 查询全局根得先把环境摆对：
  * - `PATH`：pnpm 10 起会校验全局 bin 目录在不在里面，不在就连 `root -g` 也报错
  * - `npm_config_global_bin_dir`：pnpm 传给子进程的值会盖掉这里补的，校验直接失败
  * - `CI`：corepack 在 CI 置位时才不弹「是否下载」
  * - `npm_config_update_notifier`：更新检查是后台网络请求，断网时能把查询拖成分钟级
  */
-function withQueryEnv(pnpmHome: string, run: () => string | null) {
-  // 展开时 pnpmHome 还不认识，交给调用方把主目录递进来
+function withQueryEnv<T>(run: () => T): T {
   const bins = [
-    pnpmHome,
-    path.join(pnpmHome, 'bin'),
-    path.join(getPnpmHome(), 'bin'),
+    ...globalBinDirs(),
     ...(process.env.PATH ?? '').split(path.delimiter),
   ];
-  const patch = {
+  const patch: Record<string, string | undefined> = {
     PATH: [...new Set(bins.filter(Boolean))].join(path.delimiter),
     npm_config_global_bin_dir: undefined,
     CI: 'true',
@@ -78,10 +99,10 @@ function withQueryEnv(pnpmHome: string, run: () => string | null) {
 
 /**
  * `pnpm root -g` 给出的全局根目录；查询失败（pnpm 不在 PATH、校验不通过）时返回 null，
- * 由调用方回退到遍历 `<pnpmHome>/global` 自行查找。
+ * 布局再回退到遍历 `<pnpmHome>/global` 自行查找。
  */
 function queryGlobalRoot(): string | null {
-  return withQueryEnv(getPnpmHome(), () => {
+  return withQueryEnv(() => {
     try {
       // pnpm 11 起会按附近的 packageManager 声明重启成另一个版本（甚至现下），
       // 查全局目录用不着版本切换，显式关掉。
@@ -91,35 +112,17 @@ function queryGlobalRoot(): string | null {
         'pnpm --config.manage-package-manager-versions=false root -g',
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
       );
-      const paths = output
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => path.isAbsolute(line));
 
-      return paths.at(-1) ?? output.trim();
+      return (
+        output
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .findLast((line) => path.isAbsolute(line)) ?? null
+      );
     } catch {
       return null;
     }
   });
-}
-
-/**
- * 判断 pnpm 的全局 bin 目录是否不在 PATH 中。
- *
- * pnpm 10 起 bin 目录不在 PATH 时 `pnpm i -g` 与 `pnpm root -g` 都会直接报错，
- * 全局包实际上可能已装好，只是无法通过 pnpm 查询到。
- */
-export function isBinDirMissingFromPath(): boolean {
-  const binDir = process.env.npm_config_global_bin_dir || getPnpmHome();
-  const entries = new Set(
-    (process.env.PATH ?? '')
-      .split(path.delimiter)
-      .map((entry) => path.resolve(entry || '.')),
-  );
-
-  return [binDir, path.join(binDir, 'bin')].every(
-    (dir) => !entries.has(path.resolve(dir)),
-  );
 }
 
 /** 包名里可能带着路径（`$(pwd)/node_modules/cowsay` 这类写法并不少见），
@@ -143,12 +146,12 @@ function nodeModulesIn(root: string): string {
     : path.join(root, 'node_modules');
 }
 
-export type PnpmLayout = {
-  /** 包可能落在的目录，顺序即优先级 */
-  candidates: string[];
-  /** 「全部已装包」平铺的那一层，包自己够不到的依赖在这里 */
-  depot: string | null;
-};
+/** 一个布局根下包可能待的两处固定位置，顺序即优先级；依赖表就是后面那一处 */
+function layersIn(root: string): [nodeModules: string, depot: string] {
+  const nodeModules = nodeModulesIn(root);
+
+  return [nodeModules, path.join(nodeModules, '.pnpm', 'node_modules')];
+}
 
 /** 按 mtime 从新到旧排好的子目录，文件与读不到的排掉 */
 async function dirsByMtime(dir: string): Promise<string[]> {
@@ -181,23 +184,19 @@ async function dirsByMtime(dir: string): Promise<string[]> {
 async function findLayoutRoots(): Promise<string[]> {
   const versions = await dirsByMtime(path.join(getPnpmHome(), 'global'));
   const nested = await Promise.all(versions.map((dir) => dirsByMtime(dir)));
-  const subDirs = nested.flat();
   const detected = queryGlobalRoot();
 
   // 查询结果常就是某个版本目录，留两份等于把同一份布局探两遍
   return [
-    ...new Set([...(detected ? [detected] : []), ...versions, ...subDirs]),
+    ...new Set([
+      ...(detected ? [detected] : []),
+      ...versions,
+      ...nested.flat(),
+    ]),
   ];
 }
 
-/** 一个布局下包可能待的两处固定位置：直接依赖与平铺表 */
-function layersIn(root: string): [nodeModules: string, depot: string] {
-  const nodeModules = nodeModulesIn(root);
-
-  return [nodeModules, path.join(nodeModules, '.pnpm', 'node_modules')];
-}
-
-function isDirectory(dir: string): Promise<boolean> {
+async function isDirectory(dir: string): Promise<boolean> {
   return fs.stat(dir).then(
     (stat) => stat.isDirectory(),
     () => false,
@@ -205,6 +204,13 @@ function isDirectory(dir: string): Promise<boolean> {
 }
 
 /** 布局给出的两份答案：包可能落在哪些目录、依赖表在哪一层 */
+export type PnpmLayout = {
+  /** 包可能落在的目录，顺序即优先级 */
+  candidates: string[];
+  /** 「全部已装包」平铺的那一层，包自己够不到的依赖在这里 */
+  depot: string | null;
+};
+
 async function readLayout(): Promise<PnpmLayout> {
   const roots = await findLayoutRoots();
   const layers = roots.map((root) => layersIn(root));

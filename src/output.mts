@@ -10,5 +10,4 @@ export const fmt = {
   pkg: (name: string) => pc.cyan(name),
   list: (items?: string[]) => items?.join(', ') || '',
   cmd: (text: string) => pc.magenta(text),
-  path: (text: string) => pc.yellow(text),
 };

@@ -22,10 +22,10 @@ function readArg(arg: string): string {
 }
 
 /**
- * 每个包落在哪种处境只有一种，按「最该让人去修哪」排。
+ * 播报一个包的结果，返回链接成功的命令数。
  *
+ * 每个包落在哪种处境只有一种，按「最该让人去修哪」排。
  * 「补全依赖」是对刚链接的命令的补充，要跟在本包结果后面说，别拖到后面去。
- * 返回链接成功的命令数。
  */
 function report({ pkg, commands = [], errors, ...rest }: PkgResult): number {
   if (rest.globalBinDir) {

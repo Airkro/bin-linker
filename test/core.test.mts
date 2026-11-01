@@ -50,7 +50,7 @@ const layout = (
 describe('linkPackageBins', () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    mocks.ensureDir.mockResolvedValue(true);
+    mocks.ensureDir.mockResolvedValue(undefined);
     mocks.readDir.mockResolvedValue([]);
     mocks.createSymlink.mockResolvedValue(undefined);
     mocks.resolvePath.mockImplementation(async (dir: string) => dir);
@@ -268,20 +268,21 @@ describe('linkPackageBins', () => {
 
   it('propagates the permission failure Windows cannot work around', async () => {
     // Windows 上的 EPERM 不是这个包的问题，得让 CLI 统一提示管理员权限
+    const platform = vi.spyOn(process, 'platform', 'get');
+    platform.mockReturnValue('win32');
     mocks.createSymlink.mockRejectedValue(
       Object.assign(new Error('permission denied'), { code: 'EPERM' }),
     );
 
-    await expect(linkPackageBins([PKG], { platform: 'win32' })).rejects.toThrow(
-      'permission denied',
-    );
+    await expect(linkPackageBins([PKG])).rejects.toThrow('permission denied');
+    platform.mockRestore();
   });
 });
 
 describe('linkMissingDeps', () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    mocks.ensureDir.mockResolvedValue(true);
+    mocks.ensureDir.mockResolvedValue(undefined);
     mocks.readDir.mockResolvedValue([]);
     mocks.resolvePath.mockImplementation(async (dir: string) => dir);
     mocks.getLayout.mockResolvedValue(layout(['/global/node_modules']));
@@ -336,22 +337,26 @@ describe('linkMissingDeps', () => {
     mocks.readDir.mockResolvedValue(['linked-dep']);
 
     await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(false);
-    expect(mocks.ensureDir).not.toHaveBeenCalled();
     expect(mocks.createSymlink).not.toHaveBeenCalled();
   });
 
-  it('gives up when the per-package node_modules cannot be created', async () => {
+  it('links dependencies even when the package node_modules already exists', async () => {
+    // mkdir recursive 对已存在的目录不报错；建目录失败也不该挡住补依赖，
+    // 真建不出来时建链自己会失败，由运行时照实报
     mocks.getLayout.mockResolvedValue({
       candidates: ['/global/node_modules'],
       depot: DEPOT_DIR,
     });
     mocks.readDir.mockImplementation(async (dir: string) =>
-      dir === DEPOT_DIR ? ['dep-a', 'dep-b'] : [],
+      dir === DEPOT_DIR ? ['dep-a'] : [],
     );
-    mocks.ensureDir.mockResolvedValue(false);
+    mocks.createSymlink.mockResolvedValue(undefined);
 
-    await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(false);
-    expect(mocks.createSymlink).not.toHaveBeenCalled();
+    await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(true);
+    expect(mocks.createSymlink).toHaveBeenCalledWith(
+      path.join(STORE_DIR, 'node_modules', 'dep-a'),
+      [path.join(DEPOT_DIR, 'dep-a')],
+    );
   });
 
   it('keeps going when a dependency link fails', async () => {

@@ -8,11 +8,7 @@ import {
   resolvePath,
   type PackageMeta,
 } from './fs.mts';
-import {
-  getLayout,
-  isBinDirMissingFromPath,
-  type PnpmLayout,
-} from './pnpm.mts';
+import { getLayout, isBinDirMissingFromPath } from './pnpm.mts';
 
 /** 单个命令 / 单个依赖的成败 */
 type Failure = { name: string; error: Error };
@@ -32,6 +28,9 @@ export type PkgResult = {
   errors?: Failure[];
 };
 
+/** 可执行文件的名字与其在包里的相对位置 */
+type BinEntry = [name: string, relPath: string];
+
 const projectDir = process.cwd();
 /** 链接落在工程自己的 `node_modules` 里，与包管理器装出来的一致 */
 const localBinDir = path.join(projectDir, 'node_modules', '.bin');
@@ -49,14 +48,14 @@ function settle(task: Promise<unknown>): Promise<Error | null> {
 }
 
 /** Windows 的 EPERM 只能靠管理员权限解决，交给 CLI 统一提示，别在这里吞掉 */
-function rethrowPermissions(error: unknown, platform: string): Error {
+function toFailure(name: string, error: unknown): Failure {
   const { code } = error as NodeJS.ErrnoException;
 
-  if (platform === 'win32' && code === 'EPERM') {
+  if (process.platform === 'win32' && code === 'EPERM') {
     throw error;
   }
 
-  return error as Error;
+  return { name, error: error as Error };
 }
 
 /** 从 `pkgDirs` 里挑第一个读得到元数据的位置，链断了的那份自动落到下一个 */
@@ -72,6 +71,16 @@ async function pickPackage(
   }
 
   return null;
+}
+
+/** `bin` 是字符串时命令名取包名（去掉 scope 前缀） */
+function getBinEntries(
+  pkg: string,
+  bin: NonNullable<PackageMeta['bin']>,
+): BinEntry[] {
+  return typeof bin === 'string'
+    ? [[pkg.split('/').at(-1) as string, bin]]
+    : Object.entries(bin);
 }
 
 /**
@@ -102,9 +111,11 @@ export async function linkMissingDeps(pkgDir: string): Promise<boolean> {
   ]);
   const missing = table.filter((dep) => !present.includes(dep));
 
-  if (missing.length === 0 || !(await ensureDir(depsDir))) {
+  if (missing.length === 0) {
     return false;
   }
+
+  await ensureDir(depsDir);
 
   // 依赖目录也是 store 里的真实目录，Windows 上与包本体一样建目录链接。
   // 有一个补上就算这一趟有收获，其余交给运行时。
@@ -117,17 +128,6 @@ export async function linkMissingDeps(pkgDir: string): Promise<boolean> {
   return attempts.some((error) => !error);
 }
 
-/** 可执行文件的名字与其在包里的相对位置 */
-function getBinEntries(
-  pkg: string,
-  bin: NonNullable<PackageMeta['bin']>,
-): Array<[name: string, relPath: string]> {
-  // `bin` 是字符串时命令名取包名（去掉 scope 前缀）
-  return typeof bin === 'string'
-    ? [[pkg.split('/').at(-1) as string, bin]]
-    : Object.entries(bin);
-}
-
 /**
  * 把可执行文件逐个链进工程的 `node_modules/.bin`。
  *
@@ -135,8 +135,7 @@ function getBinEntries(
  */
 async function linkBinEntries(
   pkgDir: string,
-  binEntries: Array<[name: string, relPath: string]>,
-  platform: string,
+  binEntries: BinEntry[],
 ): Promise<{ commands: string[]; errors: Failure[] }> {
   const attempts = await Promise.all(
     binEntries.map(([name, relPath]) =>
@@ -147,29 +146,26 @@ async function linkBinEntries(
       ),
     ),
   );
-  const result: { commands: string[]; errors: Failure[] } = {
-    commands: [],
-    errors: [],
-  };
+  const commands: string[] = [];
+  const errors: Failure[] = [];
 
-  binEntries.forEach(([name], index) => {
-    const error = attempts[index];
+  attempts.forEach((error, index) => {
+    const [name] = binEntries[index] as BinEntry;
 
     if (error) {
       // 单个命令没链上而已，包与其余命令照常
-      result.errors.push({ name, error: rethrowPermissions(error, platform) });
+      errors.push(toFailure(name, error));
     } else {
-      result.commands.push(name);
+      commands.push(name);
     }
   });
 
-  return result;
+  return { commands, errors };
 }
 
 async function linkPackageBin(
   pkg: string,
-  { candidates }: PnpmLayout,
-  platform: string,
+  candidates: string[],
 ): Promise<PkgResult> {
   const pkgDirs = candidates.map((dir) => path.join(dir, pkg));
   const picked = await pickPackage(pkgDirs);
@@ -198,7 +194,7 @@ async function linkPackageBin(
   // 补依赖是附赠的，补不上不影响已建好的命令链接。
   const [depsLinked, { commands, errors }] = await Promise.all([
     linkMissingDeps(pkgDir).catch(() => false),
-    linkBinEntries(pkgDir, binEntries, platform),
+    linkBinEntries(pkgDir, binEntries),
   ]);
 
   return { pkg, commands, errors, depsLinked };
@@ -206,17 +202,16 @@ async function linkPackageBin(
 
 export async function linkPackageBins(
   packages: string[],
-  { platform = process.platform } = {},
 ): Promise<PkgResult[]> {
   // 布局与包无关，一次算完给所有包用
-  const layout = await getLayout();
+  const { candidates } = await getLayout();
 
   // 一个包出错只赔上它自己：别让某个包的意外把整次运行炸掉
   return Promise.all(
     packages.map((pkg) =>
-      linkPackageBin(pkg, layout, platform).catch((error: unknown) => ({
+      linkPackageBin(pkg, candidates).catch((error: unknown) => ({
         pkg,
-        errors: [{ name: pkg, error: rethrowPermissions(error, platform) }],
+        errors: [toFailure(pkg, error)],
       })),
     ),
   );

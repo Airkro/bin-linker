@@ -1,5 +1,3 @@
-import path from 'node:path';
-
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -27,7 +25,6 @@ vi.mock('node:fs', () => ({
 const {
   createSymlink,
   ensureDir,
-  getLinkType,
   linkPointsTo,
   readDir,
   readPackageJson,
@@ -76,12 +73,16 @@ describe('filesystem helpers', () => {
     await expect(resolvePath('/global/tool')).resolves.toBe('/global/tool');
   });
 
-  it('creates directories and reports creation failures', async () => {
+  it('creates directories and swallows creation failures', async () => {
     mocks.mkdir.mockResolvedValue(undefined);
-    await expect(ensureDir('/tmp/bin-linker')).resolves.toBe(true);
+    await expect(ensureDir('/tmp/bin-linker')).resolves.toBeUndefined();
+    expect(mocks.mkdir).toHaveBeenCalledWith('/tmp/bin-linker', {
+      recursive: true,
+    });
 
+    // 建不出来就交给后面那一步报错，这里不额外造一种失败
     mocks.mkdir.mockRejectedValueOnce(new Error('read-only'));
-    await expect(ensureDir('/tmp/bin-linker')).resolves.toBe(false);
+    await expect(ensureDir('/tmp/bin-linker')).resolves.toBeUndefined();
   });
 
   it('reads package metadata and swallows broken manifests', async () => {
@@ -106,12 +107,8 @@ describe('filesystem helpers', () => {
     // 第一次链这个包时目标位置本来就没有东西，unlink 报 ENOENT 不算失败
     await expect(createSymlink(LINK, [TARGET])).resolves.toBeUndefined();
     expect(mocks.unlink).toHaveBeenCalledWith(LINK);
-    expect(mocks.symlink).toHaveBeenCalledWith(
-      TARGET,
-      LINK,
-      // 目标是可执行文件：Windows 上必须是 file 类型，否则跑不起来
-      getLinkType(TARGET),
-    );
+    // 第三个参数是 Windows 的链接类型；非 win32 上给 undefined
+    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, undefined);
   });
 
   it('leaves a link that already points at the target', async () => {
@@ -154,11 +151,7 @@ describe('filesystem helpers', () => {
 
     await createSymlink(LINK, [TARGET]);
     expect(mocks.unlink).toHaveBeenCalledWith(LINK);
-    expect(mocks.symlink).toHaveBeenCalledWith(
-      TARGET,
-      LINK,
-      getLinkType(TARGET),
-    );
+    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, undefined);
   });
 
   it('rebuilds a dangling link whose target is gone too', async () => {
@@ -190,15 +183,27 @@ describe('filesystem helpers', () => {
     expect(mocks.symlink).toHaveBeenCalled();
   });
 
-  it('picks the link type by target kind', () => {
-    // 链接目录（包本体、node_modules 里的依赖）用 junction：不需要开发者模式或管理员权限
-    expect(getLinkType('/global/node_modules/tool', 'win32')).toBe('junction');
-    // 普通文件才用 file
-    expect(
-      getLinkType(path.join('/global/node_modules/tool', 'cli.js'), 'win32'),
-    ).toBe('file');
-    // 其它平台交给默认值
-    expect(getLinkType('/global/node_modules/tool', 'linux')).toBeUndefined();
+  it('chooses the Windows link type by target kind', async () => {
+    // 目录（包本体、node_modules 里的依赖）用 junction：不需要开发者模式或管理员权限；
+    // 普通文件才用 file，file 类型对着目录必失败
+    const platform = vi.spyOn(process, 'platform', 'get');
+    mocks.readlink.mockRejectedValue(
+      Object.assign(new Error('missing'), { code: 'ENOENT' }),
+    );
+    platform.mockReturnValue('win32');
+
+    await createSymlink('/project/node_modules/tool', [
+      '/global/node_modules/tool',
+    ]);
+    expect(mocks.symlink).toHaveBeenLastCalledWith(
+      '/global/node_modules/tool',
+      '/project/node_modules/tool',
+      'junction',
+    );
+
+    await createSymlink(LINK, [TARGET]);
+    expect(mocks.symlink).toHaveBeenLastCalledWith(TARGET, LINK, 'file');
+    platform.mockRestore();
   });
 
   it('propagates unlink failures other than a missing link', async () => {
