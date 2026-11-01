@@ -1,3 +1,5 @@
+import { isAbsolute, relative } from 'node:path';
+
 import { linkPackageBins, type PkgResult } from './core.mts';
 import { fmt, log } from './output.mts';
 
@@ -53,7 +55,8 @@ function report(result: PkgResult): number {
       `${fmt.pkg(pkg)}: 已链接 ${fmt.list(commands.map((cmd) => fmt.cmd(cmd)))}`,
     );
 
-    // pnpm 全局布局下包够不到自己的间接依赖，这里顺手补齐了，说明一下免得让人以为谁改动了 store
+    // pnpm 全局布局下包够不到自己的间接依赖，这里在包里补了一层 node_modules 指回全局安装根，
+    // 说明一下免得让人以为谁改动了 store。只在真有新链接时出现，重跑不会再刷一遍。
     if (depsLinked) {
       log.info(`已为 ${fmt.pkg(pkg)} 补全依赖链接（来自 pnpm 全局安装根）`);
     }
@@ -66,9 +69,35 @@ function report(result: PkgResult): number {
   return commands.length;
 }
 
+/**
+ * 把工程内的绝对路径还原成相对路径。
+ *
+ * `node_modules` 的实际位置按包名拼，写成 `/…/node_modules/cowsay`
+ * （脚本里 `$(pwd)/node_modules/xxx` 就是这么来的）会解析不到。
+ */
+function stripCwd(arg: string): string {
+  if (!isAbsolute(arg)) {
+    return arg;
+  }
+
+  // Windows 上盘符大小写、大小写不敏感都可能让 startsWith 失手，先归一
+  const rel = relative(process.cwd(), arg);
+
+  // 工程外的绝对路径保持原样，别把它变成一串 ../..
+  return rel && !rel.startsWith('..') ? rel : arg;
+}
+
 /** 链接 argv 里的包，把结果写进日志，并给出退出码 */
 export async function run(): Promise<number> {
-  const packages = process.argv.slice(2).filter((arg) => !arg.startsWith('-'));
+  // 同一个包写两遍只该链一次：重复跑一遍会把「已链接」播报两遍，命令数也跟着翻倍
+  const packages = [
+    ...new Set(
+      process.argv
+        .slice(2)
+        .filter((arg) => !arg.startsWith('-'))
+        .map((arg) => stripCwd(arg)),
+    ),
+  ];
 
   if (packages.length === 0) {
     log.warn('请指定要链接的包名');

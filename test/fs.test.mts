@@ -3,18 +3,18 @@ import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-  access: vi.fn(),
   mkdir: vi.fn(),
   readFile: vi.fn(),
+  readlink: vi.fn(),
   symlink: vi.fn(),
   unlink: vi.fn(),
 }));
 
 vi.mock('node:fs', () => ({
   promises: {
-    access: mocks.access,
     mkdir: mocks.mkdir,
     readFile: mocks.readFile,
+    readlink: mocks.readlink,
     symlink: mocks.symlink,
     unlink: mocks.unlink,
   },
@@ -61,41 +61,49 @@ describe('filesystem helpers', () => {
   });
 
   it('replaces an existing link', async () => {
-    mocks.access.mockResolvedValueOnce(undefined);
+    mocks.readlink.mockRejectedValueOnce({ code: 'ENOENT' });
     mocks.unlink.mockResolvedValueOnce(undefined);
 
     await expect(createSymlink('/target', '/link')).resolves.toBe(true);
     expect(mocks.unlink).toHaveBeenCalledWith('/link');
   });
 
+  it('leaves a link that already points at the target', async () => {
+    // 命令链接在重跑、`pnpm <cmd>` 前置钩子里是常态，重建纯属两次多余的写操作
+    mocks.readlink.mockResolvedValueOnce('/target');
+
+    await expect(createSymlink('/target', '/link')).resolves.toBe(true);
+    expect(mocks.unlink).not.toHaveBeenCalled();
+    expect(mocks.symlink).not.toHaveBeenCalled();
+  });
+
   it('creates symlinks, replacing an existing link', async () => {
-    mocks.access.mockResolvedValueOnce(undefined);
+    mocks.readlink.mockRejectedValueOnce({ code: 'ENOENT' });
     mocks.unlink.mockRejectedValueOnce({ code: 'ENOENT' });
 
     await expect(createSymlink('/target', '/link')).resolves.toBe(true);
     expect(mocks.symlink).toHaveBeenCalledWith(
       '/target',
       '/link',
+      // 目标是可执行文件：Windows 上必须是 file 类型，否则跑不起来
       isWindows ? 'file' : undefined,
     );
   });
 
-  it('refuses to link a missing target', async () => {
-    mocks.access.mockRejectedValueOnce(new Error('missing target'));
-
-    await expect(createSymlink('/target', '/link')).rejects.toThrow(
-      '目标不存在',
+  it('picks the link type by target kind', () => {
+    // 链接目录（包本体、node_modules 里的依赖）用 junction：不需要开发者模式或管理员权限
+    expect(getLinkType(undefined, 'win32')).toBe('junction');
+    expect(getLinkType('/global/node_modules/tool', 'win32')).toBe('junction');
+    // 普通文件才用 file
+    expect(getLinkType('/global/node_modules/tool/cli.js', 'win32')).toBe(
+      'file',
     );
-    expect(mocks.symlink).not.toHaveBeenCalled();
-  });
-
-  it('only pins the link type on Windows', () => {
-    expect(getLinkType('win32')).toBe('file');
-    expect(getLinkType('linux')).toBeUndefined();
+    // 其它平台交给默认值
+    expect(getLinkType('/global/node_modules/tool', 'linux')).toBeUndefined();
   });
 
   it('propagates unlink failures other than a missing link', async () => {
-    mocks.access.mockResolvedValueOnce(undefined);
+    mocks.readlink.mockRejectedValueOnce({ code: 'ENOENT' });
     mocks.unlink.mockRejectedValueOnce(new Error('cannot unlink'));
 
     await expect(createSymlink('/target', '/link')).rejects.toThrow(

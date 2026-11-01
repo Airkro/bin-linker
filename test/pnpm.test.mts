@@ -21,8 +21,9 @@ const {
   getPnpmHome,
   isPnpmBinDirMissingFromPath,
   pnpmGlobalRoot,
+  normalizePkgName,
   resolveGlobalDepotDir,
-  resolveGlobalPkgDir,
+  resolveGlobalPkgDirs,
 } = await import('../src/pnpm.mts');
 
 const GLOBAL_NODE_MODULES = '/global/node_modules';
@@ -76,11 +77,15 @@ async function withEnv(
 }
 
 describe('pnpm global layout', () => {
-  beforeEach(() => {
+  // 查询结果、版本目录清单、布局根、依赖表都按模块实例记忆化，每条用例都要从头问一遍
+  let api = { resolveGlobalPkgDirs, resolveGlobalDepotDir };
+
+  beforeEach(async () => {
     vi.resetAllMocks();
     mocks.execSync.mockReturnValue('/global/node_modules\n');
     mocks.stat.mockResolvedValue(isDir);
     mocks.readdir.mockResolvedValue([]);
+    api = await load('fresh');
   });
 
   it('resolves pnpm home defaults per platform', async () => {
@@ -156,8 +161,9 @@ describe('pnpm global layout', () => {
   });
 
   it('keeps the pinned path entries unique when no PATH is inherited', async () => {
-    await withEnv({ PATH: undefined, PNPM_HOME: undefined }, () => {
-      expect(getPnpmGlobalPath()).toBe('/global/node_modules');
+    await withEnv({ PATH: undefined, PNPM_HOME: undefined }, async () => {
+      const isolated = await load('no-path');
+      expect(isolated.getPnpmGlobalPath()).toBe('/global/node_modules');
       expect(process.env.PATH).toBeUndefined();
     });
   });
@@ -167,13 +173,16 @@ describe('pnpm global layout', () => {
       '[WARN] Using --global skips the package manager check for this project\n/pnpm/global/v11/node_modules\n',
     );
 
-    expect(getPnpmGlobalPath()).toBe('/pnpm/global/v11/node_modules');
+    const warned = await load('warned');
+    expect(warned.getPnpmGlobalPath()).toBe('/pnpm/global/v11/node_modules');
 
     mocks.execSync.mockReturnValue('global root unavailable\n');
-    expect(getPnpmGlobalPath()).toBe('global root unavailable');
+    const fallback = await load('root-fallback');
+    expect(fallback.getPnpmGlobalPath()).toBe('global root unavailable');
 
     mocks.execSync.mockReturnValue('');
-    expect(getPnpmGlobalPath()).toBe('');
+    const empty = await load('root-empty');
+    expect(empty.getPnpmGlobalPath()).toBe('');
   });
 
   it('returns null when pnpm cannot be queried', async () => {
@@ -181,24 +190,38 @@ describe('pnpm global layout', () => {
       throw new Error('pnpm not found');
     });
 
-    expect(getPnpmGlobalPath()).toBeNull();
+    const isolated = await load('query-failed');
+    expect(isolated.getPnpmGlobalPath()).toBeNull();
 
-    // 探测失败时按版本号从高到低推断候选根目录，回退到遍历版本目录
+    // 探测失败时回退到遍历 <pnpmHome>/global 下的版本目录
     await withEnv({ PNPM_HOME: '/pnpm-home' }, async () => {
-      const isolated = await load('query-failed');
-      const expected = path.join('/pnpm-home', 'global', 'v11', 'tool');
+      const fallback = await load('query-failed-fallback');
+      const expected = path.join(
+        '/pnpm-home',
+        'global',
+        'v11',
+        'node_modules',
+        'tool',
+      );
 
+      mocks.readdir.mockImplementation(async (dir: string) =>
+        dir === path.join('/pnpm-home', 'global') ? ['v11'] : [],
+      );
       mocks.stat.mockImplementation(async (dir: string) => {
         if (dir === expected) {
           return isDir;
         }
 
+        if (dir === path.join('/pnpm-home', 'global', 'v11')) {
+          return isDirWithMtime(1);
+        }
+
         throw new Error('missing');
       });
 
-      await expect(isolated.resolveGlobalPkgDir('tool')).resolves.toBe(
+      await expect(fallback.resolveGlobalPkgDirs('tool')).resolves.toEqual([
         expected,
-      );
+      ]);
     });
   });
 
@@ -237,15 +260,17 @@ describe('pnpm global layout', () => {
       mocks.execSync.mockReturnValue(`${globalModules}\n`);
       mocks.readdir.mockClear();
 
-      await expect(isolated.resolveGlobalPkgDir('tool')).resolves.toBe(
+      await expect(isolated.resolveGlobalPkgDirs('tool')).resolves.toEqual([
         path.join(globalModules, 'tool'),
-      );
+      ]);
       // 直接布局命中就不必遍历虚拟目录
       expect(
         mocks.readdir.mock.calls.every(([dir]) => dir !== globalModules),
       ).toBe(true);
 
       mocks.execSync.mockReturnValue('');
+      // 布局根也是记忆化的：换一份实例，重新按新的全局布局来
+      const pnpm10 = await load('layouts-pnpm10');
       mocks.readdir.mockImplementation(async (dir: string) =>
         dir === root ? ['5'] : [],
       );
@@ -254,13 +279,18 @@ describe('pnpm global layout', () => {
           return isDir;
         }
 
+        if (dir === path.join(root, '5')) {
+          return isDirWithMtime(1);
+        }
+
         throw new Error('missing');
       });
-      await expect(isolated.resolveGlobalPkgDir('tool')).resolves.toBe(
+      await expect(pnpm10.resolveGlobalPkgDirs('tool')).resolves.toEqual([
         path.join(root, '5', 'node_modules', 'tool'),
-      );
+      ]);
 
       mocks.execSync.mockReturnValue(`${globalModules}\n`);
+      const pnpm11 = await load('layouts-pnpm11');
       mocks.readdir.mockResolvedValue(['a1b2c3d4e5f6']);
       mocks.stat.mockImplementation(async (dir: string) => {
         if (
@@ -270,19 +300,62 @@ describe('pnpm global layout', () => {
           return isDir;
         }
 
+        // 版本目录与里面的哈希目录都要能被认成目录，才会被逐层展开
+        if (dir === globalModules) {
+          return isDirWithMtime(1);
+        }
+
+        if (dir === path.join(globalModules, 'a1b2c3d4e5f6')) {
+          return isDirWithMtime(1);
+        }
+
         throw new Error('missing');
       });
-      await expect(isolated.resolveGlobalPkgDir('tool')).resolves.toBe(
+      await expect(pnpm11.resolveGlobalPkgDirs('tool')).resolves.toEqual([
         path.join(globalModules, 'a1b2c3d4e5f6', 'node_modules', 'tool'),
-      );
+      ]);
     });
+  });
+
+  it('ignores version entries that are files', async () => {
+    // 全局根目录下混着文件（如 .modules.yaml），它们不是版本目录，不参与查找
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) =>
+      dir === pnpmGlobalRoot ? ['manifest.json', 'v11'] : [],
+    );
+    mocks.stat.mockImplementation(async (dir: string) => {
+      if (dir === path.join(pnpmGlobalRoot, 'manifest.json')) {
+        return { isDirectory: () => false };
+      }
+
+      if (dir === path.join(pnpmGlobalRoot, 'v11')) {
+        return isDirWithMtime(1);
+      }
+
+      throw new Error('missing');
+    });
+
+    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([]);
+  });
+
+  it('normalizes package names that carry a path', async () => {
+    // `$(pwd)/node_modules/cowsay`、`./node_modules/@scope/pkg` 都得还原成包名，
+    // node_modules 的位置是按包名拼的
+    expect(normalizePkgName('cowsay')).toBe('cowsay');
+    expect(normalizePkgName('./node_modules/cowsay')).toBe('cowsay');
+    expect(normalizePkgName('/a/b/node_modules/@scope/pkg')).toBe('@scope/pkg');
+    expect(normalizePkgName('@scope/pkg')).toBe('@scope/pkg');
+    // 只剩 scope 一段（用户手抖）时别丢成空串
+    expect(normalizePkgName('@scope')).toBe('@scope');
+    // 空串这种退化输入别抛，原样回去，交给「找不到包」报
+    expect(normalizePkgName('')).toBe('');
   });
 
   it('keeps the pnpm 10 root layout lookup cheap', async () => {
     // pnpm 10：包直接位于全局根目录下，不必遍历虚拟目录
-    await expect(resolveGlobalPkgDir('tool')).resolves.toBe(
+    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([
       path.join(GLOBAL_NODE_MODULES, 'tool'),
-    );
+    ]);
     // 只有扫版本目录那一步会读目录，虚拟目录不必再读
     expect(
       mocks.readdir.mock.calls.every(([dir]) => dir !== GLOBAL_NODE_MODULES),
@@ -313,7 +386,7 @@ describe('pnpm global layout', () => {
       throw new Error('vanished');
     });
 
-    await expect(resolveGlobalPkgDir('tool')).resolves.toBe(expected);
+    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([expected]);
 
     const searched = mocks.stat.mock.calls.map(([dir]) => String(dir));
     const firstSeen = (name: string) =>
@@ -342,9 +415,63 @@ describe('pnpm global layout', () => {
       throw new Error('missing');
     });
 
-    await expect(resolveGlobalPkgDir('tool')).resolves.toBeNull();
+    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([]);
+    // 探测到的布局根与扫版本目录得到的同一个，只探一遍
     expect(searched.filter((dir) => dir === versionDir)).toHaveLength(1);
-    expect(searched).toContain(path.join(versionDir, 'tool'));
+    expect(searched).toContain(path.join(versionDir, 'node_modules', 'tool'));
+  });
+
+  it('finds the package inside a content-addressed dir', async () => {
+    // 包只在哈希目录里（pnpm 11）：先按 mtime 排好哈希目录，再逐个看两处固定位置
+    const versionDir = path.join(pnpmGlobalRoot, 'v11');
+    const expected = path.join(versionDir, 'hash123', 'node_modules', 'tool');
+
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) =>
+      dir === pnpmGlobalRoot ? ['v11'] : ['hash123'],
+    );
+    mocks.stat.mockImplementation(async (dir: string) => {
+      if (dir === versionDir || dir === path.join(versionDir, 'hash123')) {
+        return isDirWithMtime(1);
+      }
+
+      if (dir === expected) {
+        return isDir;
+      }
+
+      throw new Error('missing');
+    });
+
+    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([expected]);
+  });
+
+  it('stops at a layout root that has node_modules but not the package', async () => {
+    // 版本目录下已经有 node_modules（pnpm 10 布局），包不在里面就是不在这一层，
+    // 不必再展开它的子目录
+    const versionDir = path.join(pnpmGlobalRoot, 'v11');
+    const readDirs: string[] = [];
+
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      readDirs.push(dir);
+
+      return dir === pnpmGlobalRoot ? ['v11'] : ['node_modules', 'hash123'];
+    });
+    mocks.stat.mockImplementation(async (dir: string) => {
+      if (dir === versionDir) {
+        return isDirWithMtime(1);
+      }
+
+      // 版本目录下混着文件（.modules.yaml 之类），文件不参与查找
+      if (dir === path.join(versionDir, 'node_modules')) {
+        return { isDirectory: () => false };
+      }
+
+      throw new Error('missing');
+    });
+
+    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([]);
+    expect(readDirs).not.toContain(path.join(versionDir, 'hash123'));
   });
 
   it('treats an unreadable global root as empty', async () => {
@@ -352,7 +479,7 @@ describe('pnpm global layout', () => {
     mocks.stat.mockRejectedValue(new Error('missing'));
     mocks.readdir.mockRejectedValue(new Error('permission denied'));
 
-    await expect(resolveGlobalPkgDir('ghost')).resolves.toBeNull();
+    await expect(api.resolveGlobalPkgDirs('ghost')).resolves.toEqual([]);
     expect(mocks.readdir).toHaveBeenCalledWith(pnpmGlobalRoot);
   });
 
@@ -378,15 +505,21 @@ describe('pnpm global layout', () => {
         return isDir;
       }
 
+      if (dir === versionDir || dir === path.join(versionDir, 'hash123')) {
+        return isDirWithMtime(1);
+      }
+
       throw new Error('missing');
     });
 
-    await expect(resolveGlobalDepotDir()).resolves.toBe(depot);
+    const isolated = await load('depot-nested');
+
+    await expect(isolated.resolveGlobalDepotDir()).resolves.toBe(depot);
   });
 
   it('returns null when no version dir exposes a dependency table', async () => {
     mocks.stat.mockRejectedValue(new Error('missing'));
 
-    await expect(resolveGlobalDepotDir()).resolves.toBeNull();
+    await expect(api.resolveGlobalDepotDir()).resolves.toBeNull();
   });
 });

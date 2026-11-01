@@ -37,6 +37,28 @@ describe('cli', () => {
     process.argv = ['node', 'bin-linker'];
   });
 
+  it('dedupes repeated packages and strips the working directory', async () => {
+    // 同一个包写两遍只该链一次；脚本里常传 $(pwd)/node_modules/xxx 这种绝对路径，
+    // node_modules 的位置按包名拼，绝对路径会解析不到，得先在工程内还原成相对路径。
+    process.argv = [
+      'node',
+      'bin-linker',
+      'tool',
+      'tool',
+      `${process.cwd()}/node_modules/tool`,
+      '/elsewhere/other-pkg',
+    ];
+    mocks.linkPackageBins.mockResolvedValue({ results: [] });
+
+    await run();
+
+    expect(mocks.linkPackageBins).toHaveBeenCalledWith([
+      'tool',
+      'node_modules/tool',
+      '/elsewhere/other-pkg',
+    ]);
+  });
+
   it('shows usage when no packages are supplied', async () => {
     await expect(run()).resolves.toBe(0);
     expect(mocks.warn).toHaveBeenCalled();

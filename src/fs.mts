@@ -3,9 +3,23 @@ import path from 'node:path';
 
 export const isWindows = process.platform === 'win32';
 
-/** Windows 建软链必须指明类型：链的是可执行文件，用 file */
-export function getLinkType(platform = process.platform): 'file' | undefined {
-  return platform === 'win32' ? 'file' : undefined;
+/**
+ * Windows 建软链必须指明类型。
+ *
+ * 链接的是**目录**（包本体、`node_modules` 里的依赖），只能给 `junction`：
+ * `file` 类型对目录必失败，`dir` 类型又要开发者模式或管理员权限
+ * （EPERM 那套提示原本就是在替这件事擦屁股）。junction 由文件系统层实现，免权限。
+ * 只有真对着一个文件建链时才用 `file`。
+ */
+export function getLinkType(
+  target?: string,
+  platform = process.platform,
+): 'file' | 'junction' | undefined {
+  if (platform !== 'win32') {
+    return undefined;
+  }
+
+  return target && path.extname(target) ? 'file' : 'junction';
 }
 
 /** 链接落在工程自己的 `node_modules` 里，与包管理器装出来的一致 */
@@ -21,18 +35,15 @@ export async function ensureDir(dir: string): Promise<boolean> {
   }
 }
 
-/** 建软链，覆盖已有的那一份；链接指向的文件不存在时报错 */
+/** 建软链，覆盖已有的那一份 */
 export async function createSymlink(
   target: string,
   link: string,
 ): Promise<boolean> {
-  const exists = await fs.access(target).then(
-    () => true,
-    () => false,
-  );
-
-  if (!exists) {
-    throw new Error(`目标不存在: ${target}`);
+  // 已经指着同一个目标就跳过：命令链接在重跑、`pnpm <cmd>` 前置钩子里是常态，
+  // 而 unlink + symlink 是两次写操作，还会让链接短暂消失
+  if ((await fs.readlink(link).catch(() => null)) === target) {
+    return true;
   }
 
   // 不存在的链接当它已经删掉了
@@ -44,7 +55,7 @@ export async function createSymlink(
     }
   }
 
-  await fs.symlink(target, link, getLinkType());
+  await fs.symlink(target, link, getLinkType(target));
 
   return true;
 }
