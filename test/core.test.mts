@@ -5,32 +5,23 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   createSymlink: vi.fn(),
   ensureDir: vi.fn(),
-  findPackageDirs: vi.fn(),
+  getLayout: vi.fn(),
   isBinDirMissingFromPath: vi.fn(() => false),
-  isWindows: true,
-  readdir: vi.fn(),
+  readDir: vi.fn(),
   readPackageJson: vi.fn(),
-  realpath: vi.fn(),
-  resolveDepotDir: vi.fn(),
+  resolvePath: vi.fn(),
 }));
 
 vi.mock('../src/fs.mts', () => ({
   createSymlink: mocks.createSymlink,
   ensureDir: mocks.ensureDir,
-  get isWindows() {
-    return mocks.isWindows;
-  },
-  localBinDir: '/project/node_modules/.bin',
-  projectDir: '/project',
+  readDir: mocks.readDir,
   readPackageJson: mocks.readPackageJson,
+  resolvePath: mocks.resolvePath,
 }));
 vi.mock('../src/pnpm.mts', () => ({
-  findPackageDirs: mocks.findPackageDirs,
+  getLayout: mocks.getLayout,
   isBinDirMissingFromPath: mocks.isBinDirMissingFromPath,
-  resolveDepotDir: mocks.resolveDepotDir,
-}));
-vi.mock('node:fs', () => ({
-  promises: { readdir: mocks.readdir, realpath: mocks.realpath },
 }));
 
 const { linkMissingDeps, linkPackageBins } = await import('../src/core.mts');
@@ -39,8 +30,8 @@ const PKG = 'tool';
 const PKG_DIR = path.join('/global/node_modules', PKG);
 const STORE_DIR = '/global/store/node_modules/tool';
 const DEPOT_DIR = '/global/.pnpm/node_modules';
-const BIN_DIR = '/project/node_modules/.bin';
-const PROJECT_LINK = path.join('/project', 'node_modules', PKG);
+const BIN_DIR = path.join(process.cwd(), 'node_modules', '.bin');
+const PROJECT_LINK = path.join(process.cwd(), 'node_modules', PKG);
 
 const commandCalls = () =>
   mocks.createSymlink.mock.calls.filter(([link]) => link.startsWith(BIN_DIR));
@@ -48,27 +39,53 @@ const commandCalls = () =>
 const depCalls = () =>
   mocks.createSymlink.mock.calls.filter(([link]) => link.startsWith(STORE_DIR));
 
+/** 一份只有这一处候选、没有依赖表的布局 */
+const layout = (
+  candidates: string[] = [path.join('/global/node_modules')],
+) => ({
+  candidates,
+  depot: null,
+});
+
 describe('linkPackageBins', () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    mocks.isWindows = true;
     mocks.ensureDir.mockResolvedValue(true);
-    mocks.readdir.mockResolvedValue([]);
+    mocks.readDir.mockResolvedValue([]);
     mocks.createSymlink.mockResolvedValue(undefined);
-    mocks.realpath.mockImplementation(async (dir: string) => dir);
+    mocks.resolvePath.mockImplementation(async (dir: string) => dir);
     mocks.readPackageJson.mockResolvedValue({ bin: { tool: 'tool.js' } });
-    mocks.resolveDepotDir.mockResolvedValue(null);
-    mocks.findPackageDirs.mockImplementation(async (pkg: string) => [
-      path.join('/global/node_modules', pkg),
-    ]);
+    mocks.getLayout.mockResolvedValue(layout());
     mocks.isBinDirMissingFromPath.mockReturnValue(false);
   });
 
-  it('reports an unavailable local bin directory', async () => {
-    // 连命令行都放不下，后面做什么都没意义，直接让 CLI 报系统错误
-    mocks.ensureDir.mockResolvedValue(false);
+  it('reports packages that cannot be located in the global store', async () => {
+    mocks.readPackageJson.mockResolvedValue(null);
 
-    await expect(linkPackageBins(['tool'])).rejects.toThrow('无法创建目标目录');
+    await expect(linkPackageBins(['ghost'])).resolves.toEqual([
+      { pkg: 'ghost', notFound: true },
+    ]);
+    expect(mocks.readPackageJson).toHaveBeenCalled();
+  });
+
+  it('blames the missing global bin directory before reporting not found', async () => {
+    // 全局 bin 目录不在 PATH 时 pnpm 的全局目录查询也会失效，报「找不到包」会误导用户
+    mocks.getLayout.mockResolvedValue(layout([]));
+    mocks.isBinDirMissingFromPath.mockReturnValue(true);
+
+    await expect(linkPackageBins(['ghost'])).resolves.toEqual([
+      { pkg: 'ghost', globalBinDir: true },
+    ]);
+  });
+
+  it('does not blame the environment for a package nobody installed', async () => {
+    // 布局探得出来、只是这个包不在里面：那是没装，不是环境问题
+    mocks.readPackageJson.mockResolvedValue(null);
+    mocks.isBinDirMissingFromPath.mockReturnValue(true);
+
+    await expect(linkPackageBins(['ghost'])).resolves.toEqual([
+      { pkg: 'ghost', notFound: true },
+    ]);
   });
 
   it('reports missing metadata and binless packages', async () => {
@@ -88,25 +105,6 @@ describe('linkPackageBins', () => {
     await linkPackageBins(['library']);
 
     expect(mocks.createSymlink).not.toHaveBeenCalled();
-  });
-
-  it('reports packages that cannot be located in the global store', async () => {
-    mocks.findPackageDirs.mockResolvedValue([]);
-
-    await expect(linkPackageBins(['ghost'])).resolves.toEqual([
-      { pkg: 'ghost', notFound: true },
-    ]);
-    expect(mocks.readPackageJson).not.toHaveBeenCalled();
-  });
-
-  it('blames the missing global bin directory before reporting not found', async () => {
-    // 全局 bin 目录不在 PATH 时 pnpm 的全局目录查询也会失效，报「找不到包」会误导用户
-    mocks.findPackageDirs.mockResolvedValue([]);
-    mocks.isBinDirMissingFromPath.mockReturnValue(true);
-
-    await expect(linkPackageBins(['ghost'])).resolves.toEqual([
-      { pkg: 'ghost', globalBinDir: true },
-    ]);
   });
 
   it('links commands into the project bin directory', async () => {
@@ -168,10 +166,9 @@ describe('linkPackageBins', () => {
 
   it('offers every install location to the package link', async () => {
     // 包同时留在两个版本目录里，链接指着其中任意一份就算到位
-    mocks.findPackageDirs.mockResolvedValue([
-      '/global/v11/node_modules/tool',
-      '/global/10/node_modules/tool',
-    ]);
+    mocks.getLayout.mockResolvedValue(
+      layout(['/global/v11/node_modules', '/global/10/node_modules']),
+    );
 
     await linkPackageBins([PKG]);
 
@@ -183,10 +180,9 @@ describe('linkPackageBins', () => {
 
   it('falls through to the next install location when metadata is unreadable', async () => {
     // 第一份的软链可能已经断了（读不到 package.json），后面还排着一份好的
-    mocks.findPackageDirs.mockResolvedValue([
-      '/global/v11/node_modules/tool',
-      '/global/10/node_modules/tool',
-    ]);
+    mocks.getLayout.mockResolvedValue(
+      layout(['/global/v11/node_modules', '/global/10/node_modules']),
+    );
     mocks.readPackageJson.mockImplementation(async (dir: string) =>
       dir === '/global/10/node_modules/tool'
         ? { bin: { tool: 'cli.js' } }
@@ -198,7 +194,7 @@ describe('linkPackageBins', () => {
     expect(result).toEqual(
       expect.objectContaining({ commands: ['tool'], depsLinked: false }),
     );
-    // 包本体与命令都取读得到元数据的那一份
+    // 包本体与命令都取读得到元数据的那一份，包本体仍把全部候选交给链接
     expect(mocks.createSymlink).toHaveBeenCalledWith(PROJECT_LINK, [
       '/global/v11/node_modules/tool',
       '/global/10/node_modules/tool',
@@ -221,32 +217,11 @@ describe('linkPackageBins', () => {
       },
     ]);
     // 包本体没链上就别再谈命令了
-    expect(mocks.readdir).not.toHaveBeenCalled();
+    expect(mocks.readDir).not.toHaveBeenCalled();
   });
 
-  it('propagates Windows permission failures for package links', async () => {
-    // Windows 上的 EPERM 要靠管理员权限解决，交给 CLI 统一提示
-    mocks.createSymlink.mockRejectedValueOnce(
-      Object.assign(new Error('permission denied'), { code: 'EPERM' }),
-    );
-
-    await expect(linkPackageBins([PKG])).rejects.toThrow('permission denied');
-  });
-
-  it('records Windows permission failures for command links', async () => {
-    // 包链接已经建好，EPERM 只发生在命令链接上：照旧往 CLI 冒
-    mocks.createSymlink.mockImplementation(async (link: string) => {
-      if (link === path.join(BIN_DIR, 'tool')) {
-        throw Object.assign(new Error('permission denied'), { code: 'EPERM' });
-      }
-    });
-
-    await expect(linkPackageBins([PKG])).rejects.toThrow('permission denied');
-  });
-
-  it('records EPERM command failures on unix per command', async () => {
-    // 其它平台上 EPERM 只是这一个命令没链上
-    mocks.isWindows = false;
+  it('records permission failures per command', async () => {
+    // 非 Windows 上 EPERM 只是这一个命令没链上，别把整次运行掀了
     mocks.createSymlink.mockImplementation(async (link: string) => {
       if (link === path.join(BIN_DIR, 'tool')) {
         throw Object.assign(new Error('permission denied'), { code: 'EPERM' });
@@ -255,12 +230,23 @@ describe('linkPackageBins', () => {
 
     const [result] = await linkPackageBins([PKG]);
 
+    // 只有命令没链上，包本体照常
+    expect(result?.commands).toEqual([]);
     expect(result?.errors?.[0]?.error.message).toBe('permission denied');
+  });
+
+  it('leaves a broken layout to the CLI', async () => {
+    // 布局算不出来是环境问题，不是某个包的错，往上冒给 CLI 统一提示
+    mocks.getLayout.mockRejectedValue(new Error('no pnpm'));
+
+    await expect(linkPackageBins([PKG, 'other'])).rejects.toThrow('no pnpm');
   });
 
   it('keeps the command link when the dependency pass blows up', async () => {
     // 补依赖是附赠的，整段挂掉也不该把已经建好的命令链接连坐掉
-    mocks.resolveDepotDir.mockRejectedValue(new Error('boom'));
+    mocks.getLayout
+      .mockResolvedValueOnce(layout())
+      .mockRejectedValue(new Error('boom'));
 
     await expect(linkPackageBins([PKG])).resolves.toMatchObject([
       { commands: ['tool'], depsLinked: false },
@@ -268,7 +254,7 @@ describe('linkPackageBins', () => {
   });
 
   it('continues after a package blows up unexpectedly', async () => {
-    mocks.findPackageDirs.mockRejectedValueOnce(new Error('store gone'));
+    mocks.createSymlink.mockRejectedValueOnce(new Error('store gone'));
 
     const results = await linkPackageBins(['broken', PKG]);
 
@@ -279,22 +265,38 @@ describe('linkPackageBins', () => {
     });
     expect(results[1]?.commands).toEqual(['tool']);
   });
+
+  it('propagates the permission failure Windows cannot work around', async () => {
+    // Windows 上的 EPERM 不是这个包的问题，得让 CLI 统一提示管理员权限
+    mocks.createSymlink.mockRejectedValue(
+      Object.assign(new Error('permission denied'), { code: 'EPERM' }),
+    );
+
+    await expect(linkPackageBins([PKG], { platform: 'win32' })).rejects.toThrow(
+      'permission denied',
+    );
+  });
 });
 
 describe('linkMissingDeps', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     mocks.ensureDir.mockResolvedValue(true);
-    mocks.readdir.mockResolvedValue([]);
-    mocks.realpath.mockImplementation(async (dir: string) => dir);
-    mocks.resolveDepotDir.mockResolvedValue(DEPOT_DIR);
+    mocks.readDir.mockResolvedValue([]);
+    mocks.resolvePath.mockImplementation(async (dir: string) => dir);
+    mocks.getLayout.mockResolvedValue(layout(['/global/node_modules']));
   });
 
   it('links the dependencies the package does not have', async () => {
     // pnpm 全局布局下包的真实路径在 store 里，够不到全局安装根那张依赖表。
     // 表里有、包里没有的才补，只付两次目录读的代价。
-    mocks.realpath.mockResolvedValue(STORE_DIR);
-    mocks.readdir.mockImplementation(async (dir: string) =>
+    mocks.getLayout.mockResolvedValue({
+      candidates: ['/global/node_modules'],
+      depot: DEPOT_DIR,
+    });
+    mocks.resolvePath.mockResolvedValue(STORE_DIR);
+    mocks.createSymlink.mockResolvedValue(undefined);
+    mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['missing-dep', 'present-dep'] : ['present-dep'],
     );
 
@@ -308,14 +310,18 @@ describe('linkMissingDeps', () => {
   });
 
   it('does nothing without a dependency table', async () => {
-    mocks.resolveDepotDir.mockResolvedValue(null);
-
     await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(false);
-    expect(mocks.readdir).not.toHaveBeenCalled();
+    expect(mocks.readDir).not.toHaveBeenCalled();
   });
 
   it('treats an unreadable dependency table as empty', async () => {
-    mocks.readdir.mockRejectedValue(new Error('unreadable'));
+    mocks.getLayout.mockResolvedValue({
+      candidates: ['/global/node_modules'],
+      depot: DEPOT_DIR,
+    });
+    mocks.readDir.mockImplementation(async (dir: string) =>
+      dir === DEPOT_DIR ? [] : [],
+    );
 
     await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(false);
     expect(mocks.createSymlink).not.toHaveBeenCalled();
@@ -323,7 +329,11 @@ describe('linkMissingDeps', () => {
 
   it('touches nothing when the package already has every dependency', async () => {
     // 上一次补过的依赖还在时不该重建：store 是共享的，重建是多余的写操作
-    mocks.readdir.mockResolvedValue(['linked-dep']);
+    mocks.getLayout.mockResolvedValue({
+      candidates: ['/global/node_modules'],
+      depot: DEPOT_DIR,
+    });
+    mocks.readDir.mockResolvedValue(['linked-dep']);
 
     await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(false);
     expect(mocks.ensureDir).not.toHaveBeenCalled();
@@ -331,7 +341,11 @@ describe('linkMissingDeps', () => {
   });
 
   it('gives up when the per-package node_modules cannot be created', async () => {
-    mocks.readdir.mockImplementation(async (dir: string) =>
+    mocks.getLayout.mockResolvedValue({
+      candidates: ['/global/node_modules'],
+      depot: DEPOT_DIR,
+    });
+    mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['dep-a', 'dep-b'] : [],
     );
     mocks.ensureDir.mockResolvedValue(false);
@@ -342,17 +356,27 @@ describe('linkMissingDeps', () => {
 
   it('keeps going when a dependency link fails', async () => {
     // 补不上某个依赖不该连命令一起丢掉：链接已建好，缺哪个依赖让运行时照实报错
-    mocks.readdir.mockImplementation(async (dir: string) =>
+    mocks.getLayout.mockResolvedValue({
+      candidates: ['/global/node_modules'],
+      depot: DEPOT_DIR,
+    });
+    mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['broken-dep', 'good-dep'] : [],
     );
-    mocks.createSymlink.mockRejectedValueOnce(new Error('cross-device'));
+    mocks.createSymlink
+      .mockResolvedValue(undefined)
+      .mockRejectedValueOnce(new Error('cross-device'));
 
     await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(true);
     expect(depCalls()).toHaveLength(2);
   });
 
   it('reports nothing linked when every dependency fails', async () => {
-    mocks.readdir.mockImplementation(async (dir: string) =>
+    mocks.getLayout.mockResolvedValue({
+      candidates: ['/global/node_modules'],
+      depot: DEPOT_DIR,
+    });
+    mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['broken-dep'] : [],
     );
     mocks.createSymlink.mockRejectedValue(new Error('cross-device'));
@@ -362,8 +386,13 @@ describe('linkMissingDeps', () => {
 
   it('falls back to the given directory when the store path cannot be resolved', async () => {
     // realpath 失败（如链接已断）时按原路径继续，别把整次链接拖垮
-    mocks.realpath.mockRejectedValue(new Error('dangling'));
-    mocks.readdir.mockImplementation(async (dir: string) =>
+    mocks.getLayout.mockResolvedValue({
+      candidates: ['/global/node_modules'],
+      depot: DEPOT_DIR,
+    });
+    mocks.resolvePath.mockImplementation(async (dir: string) => dir);
+    mocks.createSymlink.mockResolvedValue(undefined);
+    mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['missing-dep'] : [],
     );
 

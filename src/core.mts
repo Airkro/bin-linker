@@ -1,20 +1,21 @@
-import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
 import {
   createSymlink,
   ensureDir,
-  isWindows,
-  localBinDir,
-  projectDir,
+  readDir,
   readPackageJson,
+  resolvePath,
   type PackageMeta,
 } from './fs.mts';
 import {
-  findPackageDirs,
+  getLayout,
   isBinDirMissingFromPath,
-  resolveDepotDir,
+  type PnpmLayout,
 } from './pnpm.mts';
+
+/** 单个命令 / 单个依赖的成败 */
+type Failure = { name: string; error: Error };
 
 export type PkgResult = {
   pkg: string;
@@ -28,47 +29,49 @@ export type PkgResult = {
   globalBinDir?: boolean;
   /** 本次补上了包自己解析不到的依赖 */
   depsLinked?: boolean;
-  errors?: Array<{ name: string; error: Error }>;
+  errors?: Failure[];
 };
 
-type Failure = { name: string; error: Error };
+const projectDir = process.cwd();
+/** 链接落在工程自己的 `node_modules` 里，与包管理器装出来的一致 */
+const localBinDir = path.join(projectDir, 'node_modules', '.bin');
 
-/** `bin` 是字符串时命令名取包名（去掉 scope 前缀） */
-function getBinEntries(
-  pkg: string,
-  bin: NonNullable<PackageMeta['bin']>,
-): Array<[name: string, relPath: string]> {
-  return typeof bin === 'string'
-    ? [[pkg.split('/').at(-1) as string, bin]]
-    : Object.entries(bin);
+/**
+ * 做一件事，成与不成互不牵连：返回 `null` 表示成了，否则是败因。
+ *
+ * 建命令链接、补依赖都是这个形状：一件事成不成不取决于旁边那件。
+ */
+function settle(task: Promise<unknown>): Promise<Error | null> {
+  return task.then(
+    () => null,
+    (error: Error) => error,
+  );
 }
 
-/** Windows 的 EPERM 要靠管理员权限解决（交给 CLI 统一提示），其它错误在本地处理掉 */
-function rethrowPermissions(error: unknown): Error {
-  if (isWindows && (error as NodeJS.ErrnoException).code === 'EPERM') {
+/** Windows 的 EPERM 只能靠管理员权限解决，交给 CLI 统一提示，别在这里吞掉 */
+function rethrowPermissions(error: unknown, platform: string): Error {
+  const { code } = error as NodeJS.ErrnoException;
+
+  if (platform === 'win32' && code === 'EPERM') {
     throw error;
   }
 
   return error as Error;
 }
 
-/**
- * 每项各试一次，互不牵连，结果按顺序记成「成了」或「怎么败的」。
- *
- * 建命令链接、补依赖都是这个形状：一件事成不成不取决于旁边那件。
- */
-function attemptEach<T>(
-  items: T[],
-  attempt: (item: T) => Promise<unknown>,
-): Promise<Array<Error | null>> {
-  return Promise.all(
-    items.map((item) =>
-      Promise.resolve(attempt(item)).then(
-        () => null,
-        (error: Error) => error,
-      ),
-    ),
-  );
+/** 从 `pkgDirs` 里挑第一个读得到元数据的位置，链断了的那份自动落到下一个 */
+async function pickPackage(
+  pkgDirs: string[],
+): Promise<[pkgDir: string, pkgJson: PackageMeta] | null> {
+  for (const pkgDir of pkgDirs) {
+    const pkgJson = await readPackageJson(pkgDir);
+
+    if (pkgJson) {
+      return [pkgDir, pkgJson];
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -86,19 +89,16 @@ function attemptEach<T>(
  * 补不上不算错误：命令链接已经建好，缺哪个依赖交给运行时照实报错。
  */
 export async function linkMissingDeps(pkgDir: string): Promise<boolean> {
-  const depotDir = await resolveDepotDir();
+  const { depot } = await getLayout();
 
-  if (!depotDir) {
+  if (!depot) {
     return false;
   }
 
-  const depsDir = path.join(
-    await fs.realpath(pkgDir).catch(() => pkgDir),
-    'node_modules',
-  );
+  const depsDir = path.join(await resolvePath(pkgDir), 'node_modules');
   const [table, present] = await Promise.all([
-    fs.readdir(depotDir).catch((): string[] => []),
-    fs.readdir(depsDir).catch((): string[] => []),
+    readDir(depot),
+    readDir(depsDir),
   ]);
   const missing = table.filter((dep) => !present.includes(dep));
 
@@ -107,12 +107,25 @@ export async function linkMissingDeps(pkgDir: string): Promise<boolean> {
   }
 
   // 依赖目录也是 store 里的真实目录，Windows 上与包本体一样建目录链接。
-  // 逐个试，别因为一个补不上就放弃其余；有一个补上就算这一趟有收获。
-  const attempts = await attemptEach(missing, (dep) =>
-    createSymlink(path.join(depsDir, dep), [path.join(depotDir, dep)]),
+  // 有一个补上就算这一趟有收获，其余交给运行时。
+  const attempts = await Promise.all(
+    missing.map((dep) =>
+      settle(createSymlink(path.join(depsDir, dep), [path.join(depot, dep)])),
+    ),
   );
 
   return attempts.some((error) => !error);
+}
+
+/** 可执行文件的名字与其在包里的相对位置 */
+function getBinEntries(
+  pkg: string,
+  bin: NonNullable<PackageMeta['bin']>,
+): Array<[name: string, relPath: string]> {
+  // `bin` 是字符串时命令名取包名（去掉 scope 前缀）
+  return typeof bin === 'string'
+    ? [[pkg.split('/').at(-1) as string, bin]]
+    : Object.entries(bin);
 }
 
 /**
@@ -123,71 +136,56 @@ export async function linkMissingDeps(pkgDir: string): Promise<boolean> {
 async function linkBinEntries(
   pkgDir: string,
   binEntries: Array<[name: string, relPath: string]>,
+  platform: string,
 ): Promise<{ commands: string[]; errors: Failure[] }> {
-  const attempts = await attemptEach(binEntries, ([name, relPath]) =>
-    createSymlink(path.join(localBinDir, name), [path.join(pkgDir, relPath)]),
+  const attempts = await Promise.all(
+    binEntries.map(([name, relPath]) =>
+      settle(
+        createSymlink(path.join(localBinDir, name), [
+          path.join(pkgDir, relPath),
+        ]),
+      ),
+    ),
   );
+  const result: { commands: string[]; errors: Failure[] } = {
+    commands: [],
+    errors: [],
+  };
 
-  return binEntries.reduce<{ commands: string[]; errors: Failure[] }>(
-    (result, [name], index) => {
-      const error = attempts[index];
+  binEntries.forEach(([name], index) => {
+    const error = attempts[index];
 
-      if (error) {
-        // Windows 的 EPERM 靠管理员权限解决，往上冒给 CLI 统一提示；
-        // 其它错误只赔上这一个命令，包与其余命令照常
-        result.errors.push({ name, error: rethrowPermissions(error) });
-      } else {
-        result.commands.push(name);
-      }
-
-      return result;
-    },
-    { commands: [], errors: [] },
-  );
-}
-
-/**
- * 从候选安装位置里挑出真正能用的那一份，并顺手读一次 `package.json`。
- *
- * 同一个包可能同时留在好几个版本目录里（旧版本没清），指向 store 的软链也可能已经断了。
- * 读不到元数据就换下一个候选——早前是先挑第一个路径再去读，读不到直接报「找不到包」，
- * 明明后面还排着一份好的。
- */
-async function pickPackage(
-  pkgDirs: string[],
-): Promise<[pkgDir: string, pkgJson: PackageMeta] | null> {
-  for (const pkgDir of pkgDirs) {
-    const pkgJson = await readPackageJson(pkgDir);
-
-    if (pkgJson) {
-      return [pkgDir, pkgJson];
+    if (error) {
+      // 单个命令没链上而已，包与其余命令照常
+      result.errors.push({ name, error: rethrowPermissions(error, platform) });
+    } else {
+      result.commands.push(name);
     }
-  }
+  });
 
-  return null;
+  return result;
 }
 
-async function linkPackageBin(pkg: string): Promise<PkgResult> {
-  const pkgDirs = await findPackageDirs(pkg);
+async function linkPackageBin(
+  pkg: string,
+  { candidates }: PnpmLayout,
+  platform: string,
+): Promise<PkgResult> {
+  const pkgDirs = candidates.map((dir) => path.join(dir, pkg));
+  const picked = await pickPackage(pkgDirs);
 
-  if (pkgDirs.length === 0) {
-    // 全局 bin 目录不在 PATH 时 pnpm 自身的全局目录查询会失效，
-    // 此时多半是把「环境没配好」误报成「包没安装」。
-    return isBinDirMissingFromPath()
+  if (!picked) {
+    // 全局 bin 目录不在 PATH 时 pnpm 自身的全局目录查询也会失效，
+    // 一处候选都没有多半是「环境没配好」，不是「包没安装」。
+    return isBinDirMissingFromPath() && pkgDirs.length === 0
       ? { pkg, globalBinDir: true }
       : { pkg, notFound: true };
   }
 
-  const picked = await pickPackage(pkgDirs);
-
-  if (!picked) {
-    return { pkg, notFound: true };
-  }
-
   const [pkgDir, { bin }] = picked;
-  // 没有 bin 的包连本体都不用链：它只提供库，工程里用不着它
   const binEntries = bin ? getBinEntries(pkg, bin) : [];
 
+  // 没有 bin 的包连本体都不用链：它只提供库，工程里用不着它
   if (binEntries.length === 0) {
     return { pkg, noBin: true };
   }
@@ -200,32 +198,26 @@ async function linkPackageBin(pkg: string): Promise<PkgResult> {
   // 补依赖是附赠的，补不上不影响已建好的命令链接。
   const [depsLinked, { commands, errors }] = await Promise.all([
     linkMissingDeps(pkgDir).catch(() => false),
-    linkBinEntries(pkgDir, binEntries),
+    linkBinEntries(pkgDir, binEntries, platform),
   ]);
 
   return { pkg, commands, errors, depsLinked };
 }
 
-/**
- * 一个包出错只赔上它自己：别让某个包的意外把整次运行炸掉。
- *
- * Windows 的 EPERM 例外——它靠管理员权限解决，得往上冒给 CLI 统一提示；
- * 这里只兜住「这个包没链成」，不留住那个错误。
- */
-async function settle(pkg: string): Promise<PkgResult> {
-  try {
-    return await linkPackageBin(pkg);
-  } catch (error) {
-    return { pkg, errors: [{ name: pkg, error: rethrowPermissions(error) }] };
-  }
-}
-
 export async function linkPackageBins(
   packages: string[],
+  { platform = process.platform } = {},
 ): Promise<PkgResult[]> {
-  if (!(await ensureDir(localBinDir))) {
-    throw new Error('无法创建目标目录');
-  }
+  // 布局与包无关，一次算完给所有包用
+  const layout = await getLayout();
 
-  return Promise.all(packages.map((pkg) => settle(pkg)));
+  // 一个包出错只赔上它自己：别让某个包的意外把整次运行炸掉
+  return Promise.all(
+    packages.map((pkg) =>
+      linkPackageBin(pkg, layout, platform).catch((error: unknown) => ({
+        pkg,
+        errors: [{ name: pkg, error: rethrowPermissions(error, platform) }],
+      })),
+    ),
+  );
 }

@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   mkdir: vi.fn(),
   readFile: vi.fn(),
+  readdir: vi.fn(),
   readlink: vi.fn(),
   realpath: vi.fn(),
   symlink: vi.fn(),
@@ -15,6 +16,7 @@ vi.mock('node:fs', () => ({
   promises: {
     mkdir: mocks.mkdir,
     readFile: mocks.readFile,
+    readdir: mocks.readdir,
     readlink: mocks.readlink,
     realpath: mocks.realpath,
     symlink: mocks.symlink,
@@ -26,10 +28,10 @@ const {
   createSymlink,
   ensureDir,
   getLinkType,
-  isWindows,
   linkPointsTo,
-  localBinDir,
+  readDir,
   readPackageJson,
+  resolvePath,
 } = await import('../src/fs.mts');
 
 const LINK = '/project/node_modules/.bin/tool';
@@ -58,10 +60,20 @@ describe('filesystem helpers', () => {
     mocks.symlink.mockResolvedValue(undefined);
   });
 
-  it('keeps links inside the project node_modules', () => {
-    expect(localBinDir).toBe(
-      path.resolve(process.cwd(), 'node_modules', '.bin'),
-    );
+  it('reads directories and treats unreadable ones as empty', async () => {
+    mocks.readdir.mockResolvedValueOnce(['a', 'b']);
+    await expect(readDir('/global')).resolves.toEqual(['a', 'b']);
+
+    // 不存在与没权限在这里都是「没有」
+    mocks.readdir.mockRejectedValueOnce(new Error('permission denied'));
+    await expect(readDir('/global')).resolves.toEqual([]);
+  });
+
+  it('falls back to the literal path when it cannot be resolved', async () => {
+    await expect(resolvePath('/global/tool')).resolves.toBe('/global/tool');
+
+    mocks.realpath.mockRejectedValueOnce(new Error('dangling'));
+    await expect(resolvePath('/global/tool')).resolves.toBe('/global/tool');
   });
 
   it('creates directories and reports creation failures', async () => {
@@ -98,18 +110,19 @@ describe('filesystem helpers', () => {
       TARGET,
       LINK,
       // 目标是可执行文件：Windows 上必须是 file 类型，否则跑不起来
-      isWindows ? 'file' : undefined,
+      getLinkType(TARGET),
     );
   });
 
   it('leaves a link that already points at the target', async () => {
-    // 命令链接在重跑、`pnpm <cmd>` 前置钩子里是常态，重建纯属两次多余的写操作
+    // 重跑、`pnpm <cmd>` 前置钩子里链接已就位是常态，重建纯属两次多余的写操作
     // readlink 先拿字面路径去比（省一次 realpath）——这里让字面路径就对得上
     readingOnly({ [LINK]: TARGET });
 
     await createSymlink(LINK, [TARGET]);
     expect(mocks.unlink).not.toHaveBeenCalled();
     expect(mocks.symlink).not.toHaveBeenCalled();
+    expect(mocks.realpath).not.toHaveBeenCalled();
   });
 
   it('accepts any of the candidate targets', async () => {
@@ -144,7 +157,7 @@ describe('filesystem helpers', () => {
     expect(mocks.symlink).toHaveBeenCalledWith(
       TARGET,
       LINK,
-      isWindows ? 'file' : undefined,
+      getLinkType(TARGET),
     );
   });
 
@@ -179,12 +192,11 @@ describe('filesystem helpers', () => {
 
   it('picks the link type by target kind', () => {
     // 链接目录（包本体、node_modules 里的依赖）用 junction：不需要开发者模式或管理员权限
-    expect(getLinkType(undefined, 'win32')).toBe('junction');
     expect(getLinkType('/global/node_modules/tool', 'win32')).toBe('junction');
     // 普通文件才用 file
-    expect(getLinkType('/global/node_modules/tool/cli.js', 'win32')).toBe(
-      'file',
-    );
+    expect(
+      getLinkType(path.join('/global/node_modules/tool', 'cli.js'), 'win32'),
+    ).toBe('file');
     // 其它平台交给默认值
     expect(getLinkType('/global/node_modules/tool', 'linux')).toBeUndefined();
   });

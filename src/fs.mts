@@ -1,30 +1,37 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-export const isWindows = process.platform === 'win32';
+/** 读目录，读不到时当作空目录：「不存在」与「没权限」在这里都是「没有」 */
+export function readDir(dir: string): Promise<string[]> {
+  return fs.readdir(dir).catch((): string[] => []);
+}
+
+/** 解析软链，解析不到（断链、不存在）就按字面路径算 */
+export function resolvePath(target: string): Promise<string> {
+  return fs.realpath(target).catch(() => target);
+}
 
 /**
  * Windows 建软链必须指明类型。
  *
  * 链接的是**目录**（包本体、`node_modules` 里的依赖），只能给 `junction`：
- * `file` 类型对目录必失败，`dir` 类型又要开发者模式或管理员权限
- * （EPERM 那套提示原本就是在替这件事擦屁股）。junction 由文件系统层实现，免权限。
- * 只有真对着一个文件建链时才用 `file`。
+ * `file` 类型对目录必失败，`dir` 类型又要开发者模式或管理员权限。
+ * junction 由文件系统层实现，免权限。只有真对着一个文件建链时才用 `file`。
  */
 export function getLinkType(
-  target?: string,
+  target: string,
   platform = process.platform,
 ): 'file' | 'junction' | undefined {
-  return platform === 'win32'
-    ? target && path.extname(target)
-      ? 'file'
-      : 'junction'
-    : undefined;
+  if (platform !== 'win32') {
+    return undefined;
+  }
+
+  return path.extname(target) ? 'file' : 'junction';
 }
 
-/** 链接落在工程自己的 `node_modules` 里，与包管理器装出来的一致 */
-export const projectDir = process.cwd();
-export const localBinDir = path.join(projectDir, 'node_modules', '.bin');
+function isMissing(error: NodeJS.ErrnoException): boolean {
+  return error.code === 'ENOENT';
+}
 
 export function ensureDir(dir: string): Promise<boolean> {
   return fs.mkdir(dir, { recursive: true }).then(
@@ -33,28 +40,12 @@ export function ensureDir(dir: string): Promise<boolean> {
   );
 }
 
-/** 不存在的链接当它已经删掉了 */
-function unlinkIfPresent(link: string): Promise<void> {
-  return fs.unlink(link).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== 'ENOENT') {
-      throw error;
-    }
-  });
-}
-
-/** 目标那一侧解析不到就按字面路径比：断掉的 store 链接不该让判定整段失效 */
-function resolveTargets(targets: string[]): Promise<string[]> {
-  return Promise.all(
-    targets.map((target) => fs.realpath(target).catch(() => target)),
-  );
-}
-
 /**
  * 链接是否已经指着 `targets` 里的某一份。
  *
- * 先 `readlink` 确认它是个链接（普通目录会 EINVAL，也算要重建），再 `realpath`
- * 确认它没断：两边都解析不到就退回字面路径去比，一个指向同一路径的空壳会正好对得上，
- * 于是永远不重建。所以链接那一侧解析失败时一律判否。
+ * `readlink` 先确认它确实是个链接（不存在、或是被解压进来的普通目录都要重建），
+ * 字面路径对得上就省掉文件系统解析。只有两边都还在时才比真实路径：
+ * 链接解析不到说明它是空壳，拿字面路径去比正好对得上，于是永远不重建。
  */
 export async function linkPointsTo(
   link: string,
@@ -62,43 +53,47 @@ export async function linkPointsTo(
 ): Promise<boolean> {
   const current = await fs.readlink(link).catch(() => null);
 
-  // 不存在、或压根不是链接（普通目录会 EINVAL）：都算「要重建」
   if (!current) {
     return false;
   }
 
-  // 字面路径对得上就不用再问文件系统（重跑时最常见的那条路）
   if (targets.includes(current)) {
     return true;
   }
 
-  // 解析不到就说明这是个空壳（目标已经没了），别拿字面路径去比——那样正好对得上，永远不重建
   const [realLink, realTargets] = await Promise.all([
-    fs.realpath(link).catch(() => current),
-    resolveTargets(targets),
+    fs.realpath(link).catch(() => null),
+    Promise.all(targets.map((target) => resolvePath(target))),
   ]);
 
-  return realTargets.includes(realLink);
+  return realLink !== null && realTargets.includes(realLink);
 }
 
 /**
  * 把 `link` 指向 `targets` 里第一个能用的那一份，已经指着其中任意一份就跳过。
  *
- * `targets` 是同一个东西的多个候选位置（包可能同时留在几个版本目录里），
- * 判定与写入都只在这一处，别处不要再自己读一遍链接。
+ * `targets` 是同一个东西的多个候选位置（包可能同时留在几个版本目录里）。
+ * 重跑、`pnpm <cmd>` 前置钩子里链接已就位是常态，而 unlink + symlink
+ * 是两次写操作，还会让链接短暂消失。
  */
 export async function createSymlink(
   link: string,
   targets: string[],
 ): Promise<void> {
-  // 重跑、`pnpm <cmd>` 前置钩子里链接已就位是常态，而 unlink + symlink 是两次写操作，
-  // 还会让链接短暂消失
   if (await linkPointsTo(link, targets)) {
     return;
   }
 
-  await unlinkIfPresent(link);
-  await fs.symlink(targets[0] as string, link, getLinkType(targets[0]));
+  // 不存在的链接当它已经删掉了
+  await fs.unlink(link).catch((error: NodeJS.ErrnoException) => {
+    if (!isMissing(error)) {
+      throw error;
+    }
+  });
+
+  const [target] = targets as [string];
+
+  await fs.symlink(target, link, getLinkType(target));
 }
 
 /** package.json 里用得着的那几个字段 */
