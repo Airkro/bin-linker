@@ -34,14 +34,14 @@ patch:
         # corepack 首次安装 pnpm 时会在 TTY 上问一句「是否下载」，构建里没人应答就会干等到超时
         COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
         # corepack 的 shim 落在 PNPM_HOME/bin，真实 pnpm 在 COREPACK_HOME/v1/pnpm/<版本>/bin：
-        # 两个 bin 都在 PATH 里，既满足 pnpm 10 的 PATH 校验，shim 也不会指向自己
+        # 两个 bin 都在 PATH 里，既满足 pnpm 10/11/12 的 PATH 校验，shim 也不会指向自己
         PATH: /home/.share/pnpm/bin:/home/.share/pnpm:/home/.share/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       # 下载慢的根因是网络（见上面的 registry），镜像解决之后 timeout 只是兜底：
       # 真挂住时别再干等 10 分钟才报错。timeout 同时抬高「无输出超时」与「最长执行时间」。
       timeout: 30m
       stages:
         # node 官方镜像从 25 起不再自带 corepack，从 npm 取一份（走 NPM_CONFIG_REGISTRY 的镜像），
-        # 再软链出 pnpm。不直接 `npm i -g pnpm`：pnpm 10 要求自身的 bin 目录在 PATH 里，
+        # 再软链出 pnpm。不直接 `npm i -g pnpm`：pnpm 10 起要求自身的 bin 目录在 PATH 里，
         # 装 pnpm 本体和 shim 落到同一目录会自链成环（曾报 Symbolic link loop）。
         # 下载链路偶发静默挂住（曾撞上无输出超时，构建 cnb-q73-1k6agsf87），
         # 用 timeout 兜底：真挂住就尽快失败并打出是哪一步，别干等到天亮。

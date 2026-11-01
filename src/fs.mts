@@ -97,7 +97,15 @@ export function getPnpmGlobalPath(): string | null {
   process.env[NO_UPDATE_NOTIFIER_ENV] = 'false';
 
   try {
-    const output = execSync('pnpm root -g', execOptions);
+    // pnpm 11 引入 `manage-package-manager-versions`（默认开启）：它会按最近的
+    // package.json / pnpm-workspace.yaml 里声明的 pnpm 版本重新启动自己。
+    // 被链接的全局包往往就在自己的全局目录里，那里存着「装它时用的 pnpm 版本」，
+    // 一次查询就变成「下载并启动另一个 pnpm」——慢，而且可能下载失败。
+    // 查询全局目录用不着版本切换，显式关掉。
+    const output = execSync(
+      'pnpm --config.manage-package-manager-versions=false root -g',
+      execOptions,
+    );
     const paths = output
       .split(/\r?\n/)
       .map((line) => line.trim())

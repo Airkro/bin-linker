@@ -11,7 +11,9 @@ const mocks = vi.hoisted(() => ({
   stat: vi.fn(),
   unlink: vi.fn(),
   symlink: vi.fn(),
-  execSync: vi.fn((_command?: string, _options?: unknown) => '/global/node_modules\n'),
+  execSync: vi.fn(
+    (_command?: string, _options?: unknown) => '/global/node_modules\n',
+  ),
 }));
 
 vi.mock('node:child_process', () => ({ execSync: mocks.execSync }));
@@ -394,7 +396,7 @@ describe('filesystem helpers', () => {
     expect(fallbackFs.getPnpmGlobalPath()).toBe('global root unavailable');
   });
 
-  it('queries `pnpm root -g` without the inherited global bin dir and with a piped stdin', async () => {
+  it('queries the global root without the inherited global bin dir and with a piped stdin', async () => {
     const originalGlobalBinDir = process.env.npm_config_global_bin_dir;
     const originalCi = process.env.CI;
     const originalPnpmHome = process.env.PNPM_HOME;
@@ -413,7 +415,11 @@ describe('filesystem helpers', () => {
         expect(process.env.npm_config_update_notifier).toBe('false');
         // 继承了永不关闭的 stdin 时，corepack shim 会一直等到它 end，execSync 就挂住了。
         expect((options as { stdio?: string }).stdio).toBe('pipe');
-        expect(command).toBe('pnpm root -g');
+        // pnpm 11 起会按附近的 packageManager 声明重启成另一个版本（甚至现下），
+        // 查全局目录时显式关掉版本切换。
+        expect(command).toBe(
+          'pnpm --config.manage-package-manager-versions=false root -g',
+        );
 
         return '/pnpm-home/global/v11/node_modules\n';
       });
