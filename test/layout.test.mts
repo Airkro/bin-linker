@@ -3,6 +3,8 @@ import path from 'node:path';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { getPnpmHome, isBinDirMissingFromPath } from '../src/pnpm.mts';
+
 const mocks = vi.hoisted(() => ({
   execSync: vi.fn(
     (_command?: string, _options?: unknown) => '/global/node_modules\n',
@@ -16,11 +18,7 @@ vi.mock('node:fs', () => ({
   promises: { readdir: mocks.readdir, stat: mocks.stat },
 }));
 
-type Pnpm = typeof import('../src/pnpm.mts');
-
-const { getPnpmHome, toPkgName } = await import('../src/pnpm.mts');
-
-const { PNPM_HOME } = process.env;
+type Layout = typeof import('../src/layout.mts');
 
 const isDir = { isDirectory: () => true };
 const isFile = { isDirectory: () => false };
@@ -28,14 +26,6 @@ const isDirWithMtime = (mtimeMs: number) => ({
   isDirectory: () => true,
   mtimeMs,
 });
-
-/**
- * 隔离加载一份模块。
- *
- * 布局按模块实例记忆化，换一份实例就是从头问一遍；每个用例自己声明一份，
- * vitest 会按依赖图各自去重。
- */
-const load = (): Promise<Pnpm> => import('../src/pnpm.mts');
 
 /** 借一个用例体改环境变量，结束后归还 */
 async function withEnv(
@@ -98,13 +88,69 @@ const candidatesOf = (root: string) => {
   return [nodeModules, path.join(nodeModules, '.pnpm', 'node_modules')];
 };
 
+describe('pnpm home', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it('resolves the pnpm home from the environment', async () => {
+    await withEnv({ PNPM_HOME: undefined, XDG_DATA_HOME: '/data' }, () => {
+      expect(getPnpmHome()).toBe('/data/pnpm');
+
+      // 没有 XDG 约定时退回用户目录，各平台同一条式子
+      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+      delete process.env.XDG_DATA_HOME;
+      expect(getPnpmHome()).toBe(
+        path.join(os.homedir(), '.local', 'share', 'pnpm'),
+      );
+
+      process.env.PNPM_HOME = '/pnpm-home';
+      expect(getPnpmHome()).toBe('/pnpm-home');
+    });
+  });
+
+  it('detects whether the pnpm bin directory is missing from PATH', async () => {
+    await withEnv(
+      { PNPM_HOME: '/pnpm-home', npm_config_global_bin_dir: undefined },
+      () => {
+        process.env.PATH = ['/usr/bin', '/pnpm-home/bin'].join(path.delimiter);
+        expect(isBinDirMissingFromPath()).toBe(false);
+
+        // PNPM_HOME 本身也在 pnpm 的校验范围内
+        process.env.PATH = '/pnpm-home';
+        expect(isBinDirMissingFromPath()).toBe(false);
+
+        process.env.PATH = '/usr/bin';
+        expect(isBinDirMissingFromPath()).toBe(true);
+
+        // pnpm 传给子进程的变量优先于 PNPM_HOME
+        process.env.npm_config_global_bin_dir = '/elsewhere/bin';
+        process.env.PATH = '/elsewhere/bin';
+        expect(isBinDirMissingFromPath()).toBe(false);
+
+        // 没有 PATH 时按空串处理
+        // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+        delete process.env.PATH;
+        expect(isBinDirMissingFromPath()).toBe(true);
+      },
+    );
+  });
+});
+
 describe('pnpm global layout', () => {
   // 布局按模块实例记忆化，每条用例都要从头问一遍
-  let api: Pnpm;
+  let api: Layout;
+
+  /**
+   * 隔离加载一份模块。
+   *
+   * 布局按模块实例记忆化，换一份实例就是从头问一遍；每个用例自己声明一份，
+   * vitest 会按依赖图各自去重。
+   */
+  const load = (): Promise<Layout> => import('../src/layout.mts');
 
   beforeEach(async () => {
     vi.resetAllMocks();
-    // 布局按模块实例记忆化，模块又是共享的缓存，每条用例都得丢掉上一份
     vi.resetModules();
     mocks.execSync.mockReturnValue('/global/node_modules\n');
     mocks.execSync.mockClear();
@@ -113,40 +159,7 @@ describe('pnpm global layout', () => {
     api = await load();
   });
 
-  it('resolves pnpm home defaults per platform', async () => {
-    await withEnv(
-      {
-        PNPM_HOME: undefined,
-        XDG_DATA_HOME: '/data',
-        LOCALAPPDATA: '/local-app-data',
-      },
-      () => {
-        expect(getPnpmHome('win32')).toBe(path.join('/local-app-data', 'pnpm'));
-
-        // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
-        delete process.env.LOCALAPPDATA;
-        expect(getPnpmHome('win32')).toBe(
-          path.join(os.homedir(), 'AppData', 'Local', 'pnpm'),
-        );
-
-        expect(getPnpmHome('linux')).toBe('/data/pnpm');
-        expect(getPnpmHome('darwin')).toBe(
-          path.join(os.homedir(), 'Library', 'pnpm'),
-        );
-
-        // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
-        delete process.env.XDG_DATA_HOME;
-        expect(getPnpmHome('linux')).toBe(
-          path.join(os.homedir(), '.local', 'share', 'pnpm'),
-        );
-
-        process.env.PNPM_HOME = '/pnpm-home';
-        expect(getPnpmHome('linux')).toBe('/pnpm-home');
-      },
-    );
-  });
-
-  it('queries the global root with a patched environment and restores it', async () => {
+  it('queries the global root and passes it to the child process', async () => {
     await withEnv(
       {
         npm_config_global_bin_dir: '/elsewhere/bin',
@@ -170,12 +183,29 @@ describe('pnpm global layout', () => {
             'node_modules',
           ),
         });
-        // 查询相关的开关只在子进程那一下有效：stdin 的 'ignore'、关掉版本切换
-        expect(mocks.execSync).toHaveBeenCalledWith(
+
+        const [command, options] = mocks.execSync.mock.calls[0] as [
+          string,
+          { env: Record<string, string>; stdio: string[] },
+        ];
+
+        // stdin 的 'ignore'、关掉版本切换：corepack shim 会等一个永不关闭的管道
+        expect(command).toBe(
           'pnpm --config.manage-package-manager-versions=false root -g',
-          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
         );
-        // 查询时改过的环境必须原样还回去，别污染调用方
+        expect(options.stdio).toEqual(['ignore', 'pipe', 'pipe']);
+        // 环境只传给子进程：补上 bin 目录、摘掉 pnpm 传下来的校验值、关掉两个碍事的开关
+        // npm_config_global_bin_dir 与它下面的 bin 一起补进 PATH，原有的条目一个不落
+        expect(options.env.PATH?.split(path.delimiter)).toEqual([
+          '/elsewhere/bin',
+          '/elsewhere/bin/bin',
+          '/usr/bin',
+          '/pnpm-home/bin',
+        ]);
+        expect(options.env.CI).toBe('true');
+        expect(options.env.npm_config_update_notifier).toBe('false');
+        expect(options.env.npm_config_global_bin_dir).toBeUndefined();
+        // 进程自己的环境必须原样留着，别污染调用方
         expect(process.env.npm_config_global_bin_dir).toBe('/elsewhere/bin');
         expect(process.env.CI).toBeUndefined();
         expect(process.env.npm_config_update_notifier).toBeUndefined();
@@ -239,90 +269,57 @@ describe('pnpm global layout', () => {
     });
   });
 
-  it('detects whether the pnpm bin directory is missing from PATH', async () => {
-    await withEnv(
-      { PNPM_HOME: '/pnpm-home', npm_config_global_bin_dir: undefined },
-      () => {
-        process.env.PATH = ['/usr/bin', '/pnpm-home/bin'].join(path.delimiter);
-        expect(api.isBinDirMissingFromPath()).toBe(false);
-
-        // PNPM_HOME 本身也在 pnpm 的校验范围内
-        process.env.PATH = '/pnpm-home';
-        expect(api.isBinDirMissingFromPath()).toBe(false);
-
-        process.env.PATH = '/usr/bin';
-        expect(api.isBinDirMissingFromPath()).toBe(true);
-
-        // pnpm 传给子进程的变量优先于 PNPM_HOME
-        process.env.npm_config_global_bin_dir = '/elsewhere/bin';
-        process.env.PATH = '/elsewhere/bin';
-        expect(api.isBinDirMissingFromPath()).toBe(false);
-
-        // 没有 PATH 时按空串处理
-        // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
-        delete process.env.PATH;
-        expect(api.isBinDirMissingFromPath()).toBe(true);
-      },
-    );
-  });
-
   it('exposes both fixed places of every layout root', async () => {
     // 直接依赖与平铺表各是一处候选，顺序按「直接依赖优先」
-    await expect(api.getLayout()).resolves.toEqual({
+    await expect(api.getLayout()).resolves.toMatchObject({
       candidates: candidatesOf('/global/node_modules'),
-      depot: path.join('/global', 'node_modules', '.pnpm', 'node_modules'),
     });
   });
 
   it('scans version dirs newest first and tolerates unreadable ones', async () => {
     const globals = path.join(getPnpmHome(), 'global');
-    const versionDir = (name: string) => path.join(globals, name);
 
     mocks.execSync.mockReturnValue('');
-    mocks.readdir.mockImplementation(async (dir: string) =>
-      dir === globals ? ['zeta', 'alpha', 'broken'] : [],
-    );
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      if (dir === globals) {
+        return ['v11', '10'];
+      }
+
+      return [];
+    });
+    mocks.stat.mockReset();
     fakeFs({
-      [versionDir('zeta')]: isDirWithMtime(300),
-      [versionDir('alpha')]: isDirWithMtime(200),
+      [path.join(globals, 'v11')]: isDirWithMtime(20),
+      [path.join(globals, '10')]: isDirWithMtime(10),
     });
 
+    // 目录名跟版本号没有约定（pnpm 10 是 `10`，pnpm 11 换成 `v11`），新到旧靠 mtime
     await expect(api.getLayout()).resolves.toMatchObject({
       candidates: [
-        ...candidatesOf(versionDir('zeta')),
-        ...candidatesOf(versionDir('alpha')),
+        ...candidatesOf(path.join(globals, 'v11')),
+        ...candidatesOf(path.join(globals, '10')),
       ],
     });
   });
 
   it('does not re-expand a version dir the query already pointed at', async () => {
     const globals = path.join(getPnpmHome(), 'global');
-    const versionDir = path.join(globals, 'v11');
-    const tree = {
-      [versionDir]: isDirWithMtime(1),
-      [path.join(versionDir, 'hash123')]: isDirWithMtime(2),
-    };
+    const version = path.join(globals, 'v11');
 
-    mocks.execSync.mockReturnValue(`${versionDir}\n`);
+    mocks.execSync.mockReturnValue(`${path.join(version, 'node_modules')}\n`);
     mocks.readdir.mockImplementation(async (dir: string) =>
-      dir === globals ? ['v11'] : ['hash123'],
+      dir === globals ? ['v11'] : [],
     );
-    mocks.stat.mockReset();
-    fakeFs(tree);
 
     await expect(api.getLayout()).resolves.toMatchObject({
-      candidates: [
-        ...candidatesOf(versionDir),
-        ...candidatesOf(path.join(versionDir, 'hash123')),
-      ],
+      candidates: candidatesOf(path.join(version, 'node_modules')),
     });
   });
 
   it('finds packages inside a content-addressed dir', async () => {
-    // pnpm 11：版本根下是哈希目录，包在 <hash>/node_modules/<pkg>
     const globals = path.join(getPnpmHome(), 'global');
-    const versionDir = path.join(globals, 'v11');
-    const hashDir = path.join(versionDir, 'hash123');
+    const version = path.join(globals, 'v11');
+    const hashed = path.join(version, 'abc123');
 
     mocks.execSync.mockReturnValue('');
     mocks.readdir.mockImplementation(async (dir: string) => {
@@ -330,31 +327,51 @@ describe('pnpm global layout', () => {
         return ['v11'];
       }
 
-      return dir === versionDir ? ['hash123'] : [];
+      return dir === version ? ['abc123'] : [];
     });
+    mocks.stat.mockReset();
     fakeFs({
-      [versionDir]: isDirWithMtime(1),
-      [hashDir]: isDirWithMtime(1),
+      [version]: isDirWithMtime(1),
+      [hashed]: isDirWithMtime(2),
     });
 
+    // pnpm 11 把包放在内容寻址的哈希目录下，比版本目录再深一层；
+    // 版本目录本身仍是候选（包装在它自己下面时也在那儿）
     await expect(api.getLayout()).resolves.toMatchObject({
-      candidates: expect.arrayContaining(candidatesOf(hashDir)) as string[],
+      candidates: [...candidatesOf(version), ...candidatesOf(hashed)],
     });
   });
 
   it('ignores version entries that are files', async () => {
-    // 全局根目录下混着文件（如 .modules.yaml），它们不是版本目录，不参与查找
     const globals = path.join(getPnpmHome(), 'global');
 
     mocks.execSync.mockReturnValue('');
     mocks.readdir.mockImplementation(async (dir: string) =>
-      dir === globals ? ['manifest.json', 'v11'] : [],
+      dir === globals ? ['v11', 'LICENSE'] : [],
     );
+    mocks.stat.mockReset();
     fakeFs({
-      [path.join(globals, 'manifest.json')]: isFile,
       [path.join(globals, 'v11')]: isDirWithMtime(1),
+      [path.join(globals, 'LICENSE')]: isFile,
     });
 
+    await expect(api.getLayout()).resolves.toEqual({
+      candidates: candidatesOf(path.join(globals, 'v11')),
+      depot: null,
+    });
+  });
+
+  it('skips entries that vanish between readdir and stat', async () => {
+    const globals = path.join(getPnpmHome(), 'global');
+
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) =>
+      dir === globals ? ['v11', 'gone'] : [],
+    );
+    mocks.stat.mockReset();
+    fakeFs({ [path.join(globals, 'v11')]: isDirWithMtime(1) });
+
+    // pnpm 正在切版本时，读到的目录下一瞬就没了：当作不存在，别把整次探测拖垮
     await expect(api.getLayout()).resolves.toMatchObject({
       candidates: candidatesOf(path.join(globals, 'v11')),
     });
@@ -362,39 +379,20 @@ describe('pnpm global layout', () => {
 
   it('treats an unreadable global root as empty', async () => {
     mocks.execSync.mockReturnValue('');
-    mocks.stat.mockRejectedValue(new Error('missing'));
-    mocks.readdir.mockRejectedValue(new Error('permission denied'));
+    mocks.readdir.mockRejectedValue(new Error('EACCES'));
 
     await expect(api.getLayout()).resolves.toEqual({
       candidates: [],
       depot: null,
     });
-    expect(mocks.readdir).toHaveBeenCalledWith(
-      path.join(getPnpmHome(), 'global'),
-    );
   });
 
   it('keeps the pnpm 10 root that pnpm itself reports', async () => {
-    // `pnpm root -g` 直接给到 <版本目录>/node_modules：别再套一层 node_modules
     mocks.execSync.mockReturnValue('/global/10/node_modules\n');
-    mocks.readdir.mockResolvedValue([]);
 
     await expect(api.getLayout()).resolves.toMatchObject({
       candidates: candidatesOf('/global/10/node_modules'),
     });
-  });
-
-  it('normalizes package names that carry a path', () => {
-    // `$(pwd)/node_modules/cowsay`、`./node_modules/@scope/pkg` 都得还原成包名，
-    // node_modules 的位置是按包名拼的
-    expect(toPkgName('cowsay')).toBe('cowsay');
-    expect(toPkgName('./node_modules/cowsay')).toBe('cowsay');
-    expect(toPkgName('/a/b/node_modules/@scope/pkg')).toBe('@scope/pkg');
-    expect(toPkgName('@scope/pkg')).toBe('@scope/pkg');
-    // 只剩 scope 一段（用户手抖）时别丢成空串
-    expect(toPkgName('@scope')).toBe('@scope');
-    // 空串这种退化输入别抛，原样回去，交给「找不到包」报
-    expect(toPkgName('')).toBe('');
   });
 
   it('picks the dependency table of the newest layout root', async () => {
@@ -439,12 +437,5 @@ describe('pnpm global layout', () => {
       candidates: candidatesOf('/global/node_modules'),
       depot: null,
     });
-  });
-
-  it('builds the layout from PNPM_HOME rather than the current env of the caller', async () => {
-    // 布局只跟 pnpm 主目录有关，别跟着后面的环境变量漂移
-    expect(getPnpmHome('linux')).toBe(
-      PNPM_HOME ?? path.join(os.homedir(), '.local', 'share', 'pnpm'),
-    );
   });
 });

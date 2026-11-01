@@ -1,0 +1,191 @@
+import path from 'node:path';
+
+import { promises as fs } from 'node:fs';
+
+import { createSymlink, ensureDir } from './fs.mts';
+import { isBinDirMissingFromPath } from './pnpm.mts';
+import {
+  planPackageLinks,
+  type BinEntry,
+  type LinkPlan,
+  type LocateFailure,
+} from './plan.mts';
+
+/** 单个命令 / 单个依赖的成败 */
+type Failure = { name: string; error: Error };
+
+export type PkgResult = {
+  pkg: string;
+  /** 链接成功的命令名 */
+  commands?: string[];
+  /** 本次补上了包自己解析不到的依赖 */
+  depsLinked?: boolean;
+  errors?: Failure[];
+};
+
+/**
+ * 每个包只能落在一种处境里。
+ *
+ * 处处都是 `?` 的对象谁都能拼出一个自相矛盾的结果（「找不到包」又「没有可执行文件」），
+ * 读的人还得记住哪些字段互斥；用联合类型把这份约定交给编译器，下游按 `kind` 分派就行。
+ */
+export type Outcome = LocateFailure | PkgResult;
+
+const projectDir = process.cwd();
+/** 链接落在工程自己的 `node_modules` 里，与包管理器装出来的一致 */
+const localBinDir = path.join(projectDir, 'node_modules', '.bin');
+
+/**
+ * 做一件事，成与不成互不牵连：返回 `null` 表示成了，否则是败因。
+ *
+ * 建命令链接、补依赖都是这个形状：一件事成不成不取决于旁边那件。
+ */
+function settle(task: Promise<unknown>): Promise<Error | null> {
+  return task.then(
+    () => null,
+    (error: Error) => error,
+  );
+}
+
+/** Windows 的 EPERM 只能靠管理员权限解决，交给 CLI 统一提示，别在这里吞掉 */
+function toFailure(name: string, error: unknown): Failure {
+  const { code } = error as NodeJS.ErrnoException;
+
+  if (process.platform === 'win32' && code === 'EPERM') {
+    throw error;
+  }
+
+  return { name, error: error as Error };
+}
+
+/**
+ * 把可执行文件逐个链进工程的 `node_modules/.bin`。
+ *
+ * 一个失败不影响其余命令：包本身已经就位，赔掉一个命令而已。
+ */
+async function linkBinEntries(
+  plan: LinkPlan,
+): Promise<{ commands: string[]; errors: Failure[] }> {
+  const attempts = await Promise.all(
+    plan.binEntries.map(([name, relPath]) =>
+      settle(
+        createSymlink(path.join(localBinDir, name), [
+          path.join(plan.pkgDir, relPath),
+        ]),
+      ),
+    ),
+  );
+  const commands: string[] = [];
+  const errors: Failure[] = [];
+
+  attempts.forEach((error, index) => {
+    const [name] = plan.binEntries[index] as BinEntry;
+
+    if (error) {
+      // 单个命令没链上而已，包与其余命令照常
+      errors.push(toFailure(name, error));
+    } else {
+      commands.push(name);
+    }
+  });
+
+  return { commands, errors };
+}
+
+/**
+ * 把计划里缺的依赖补进包自己的 `node_modules`，返回是否真的补上了东西。
+ *
+ * 补不上不算错误：命令链接已经建好，缺哪个依赖交给运行时照实报错。
+ */
+async function linkDeps(plan: LinkPlan): Promise<boolean> {
+  if (plan.deps.length === 0) {
+    return false;
+  }
+
+  // 依赖目录也是 store 里的真实目录，Windows 上与包本体一样建目录链接。
+  // 有一个补上就算这一趟有收获，其余交给运行时。
+  const attempts = await Promise.all(
+    plan.deps.map(({ link, target }) => settle(createSymlink(link, [target]))),
+  );
+
+  return attempts.includes(null);
+}
+
+/**
+ * 铺好链接要落的目录，返回真的铺出来的那些。
+ *
+ * 工程可能刚 `npm init`，一个 `node_modules` 都没有；store 里那个包也可能从没建过
+ * `node_modules`。软链不会替谁建父目录，缺一层就 ENOENT——报出来只是一句
+ * 「no such file or directory」，看着像包没装，其实是目录没铺。
+ *
+ * 只返回建成功的：已经在那儿的目录不该被 unlink 掉，那是别人的东西。
+ * 建不成也不挡事，真需要它时建链自己会照实报错。
+ */
+async function prepareDirs(plan: LinkPlan): Promise<string[]> {
+  const dirs = [
+    localBinDir,
+    path.dirname(plan.pkgLink),
+    ...plan.deps.map(({ link }) => path.dirname(link)),
+  ];
+  const made = await Promise.allSettled(dirs.map((dir) => ensureDir(dir)));
+
+  return dirs.filter((_, index) => made[index]?.status === 'fulfilled');
+}
+
+/**
+ * 收尾：这一趟为落链接铺出来的目录，没人用得上就撤掉，别在工程里留空壳。
+ *
+ * 只有空目录才删得掉，里面已经有东西时 `rmdir` 自己会失败，这里不必先探一遍。
+ */
+async function dropEmptyDirs(dirs: string[]): Promise<void> {
+  for (const dir of dirs.toReversed()) {
+    await fs.rmdir(dir).catch(() => undefined);
+  }
+}
+
+/** 执行一份计划：包本体 → 命令与依赖并行 */
+async function runPlan(pkg: string, plan: LinkPlan): Promise<PkgResult> {
+  // 包本体与全部命令都落在工程自己的 node_modules 里。
+  // 候选位置按新到旧一起交给链接：任意一份已到位就不重建，要建就建最新那份。
+  const madeDirs = await prepareDirs(plan);
+
+  await createSymlink(plan.pkgLink, plan.pkgDirs);
+
+  // 补依赖与建命令链接互不相干，并行：补依赖要读 store 那张表，动辄几十个 syscall。
+  // 补依赖是附赠的，补不上不影响已建好的命令链接。
+  const [depsLinked, linkResult] = await Promise.all([
+    linkDeps(plan),
+    linkBinEntries(plan),
+  ]);
+
+  // 一件都没落下就把铺出来的目录撤掉：工程里不该多出空的 node_modules
+  await dropEmptyDirs(madeDirs);
+
+  return { pkg, ...linkResult, depsLinked };
+}
+
+async function linkPackageBin(pkg: string): Promise<Outcome> {
+  const outcome = await planPackageLinks(pkg, projectDir);
+
+  if ('pkgLink' in outcome) {
+    return runPlan(pkg, outcome);
+  }
+
+  // 全局 bin 目录不在 PATH 时 pnpm 自身的全局目录查询也会失效，
+  // 一处候选都没有多半是「环境没配好」，不是「包没安装」。
+  return outcome.pkgDirs.length === 0 && isBinDirMissingFromPath()
+    ? { pkg, pkgDirs: outcome.pkgDirs, globalBinDir: true }
+    : outcome;
+}
+
+export async function linkPackageBins(packages: string[]): Promise<Outcome[]> {
+  // 一个包出错只赔上它自己：别让某个包的意外把整次运行炸掉
+  return Promise.all(
+    packages.map((pkg) =>
+      linkPackageBin(pkg).catch((error: unknown) => ({
+        pkg,
+        errors: [toFailure(pkg, error)],
+      })),
+    ),
+  );
+}

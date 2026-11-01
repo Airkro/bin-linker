@@ -7,11 +7,11 @@ const mocks = vi.hoisted(() => ({
   warn: vi.fn(),
 }));
 
-vi.mock('../src/core.mts', () => ({
+vi.mock('../src/link.mts', () => ({
   linkPackageBins: mocks.linkPackageBins,
 }));
-vi.mock('../src/pnpm.mts', () => ({
-  // 名字归一的细节在 pnpm.test 里验，这里只要它把路径尾巴去掉
+vi.mock('../src/name.mts', () => ({
+  // 名字归一的细节在 name.test 里验，这里只要它把路径尾巴去掉
   toPkgName: (name: string) => name.replace(/^.*\//, ''),
 }));
 vi.mock('../src/output.mts', () => ({
@@ -78,7 +78,7 @@ describe('cli', () => {
         { pkg: 'empty', noBin: true },
         { pkg: 'tool', commands: ['tool'] },
       ]),
-    ).resolves.toBe(0);
+    ).resolves.toBe(1);
     expect(mocks.linkPackageBins).toHaveBeenCalledWith([
       'missing',
       'empty',
@@ -109,6 +109,20 @@ describe('cli', () => {
     expect(mocks.info).toHaveBeenCalledTimes(1);
   });
 
+  it('does not fail when other packages linked fine', async () => {
+    // 总览说的是「一共链上几条命令」，各包的结论各自说过了，不必再报一遍
+    process.argv = ['node', 'bin-linker', 'two', 'ghost'];
+
+    await expect(
+      runWith([
+        { pkg: 'two', commands: ['one', 'two'] },
+        { pkg: 'ghost', notFound: true },
+      ]),
+    ).resolves.toBe(1);
+    expect(said(mocks.info.mock.calls, '共链接了')).toContain('2');
+    expect(said(mocks.warn.mock.calls, '找不到包')).toContain('ghost');
+  });
+
   it('warns and fails when nothing links', async () => {
     process.argv = ['node', 'bin-linker', 'broken'];
 
@@ -131,7 +145,7 @@ describe('cli', () => {
         { pkg: 'tool', commands: ['tool'], depsLinked: true },
         { pkg: 'ghost', notFound: true },
       ]),
-    ).resolves.toBe(0);
+    ).resolves.toBe(1);
 
     expect(said(mocks.info.mock.calls, '补全依赖')).toContain('tool');
     // 补依赖的说明排在「找不到那个包」之前
@@ -148,7 +162,7 @@ describe('cli', () => {
   });
 
   it('fails when the pnpm global bin directory is missing from PATH', async () => {
-    process.argv = ['node', 'bin-linker', 'tool'];
+    process.argv = ['node', 'bin-linker', 'tool', 'other'];
 
     await expect(
       runWith([
@@ -156,7 +170,8 @@ describe('cli', () => {
         { pkg: 'other', commands: ['other'] },
       ]),
     ).resolves.toBe(1);
-    expect(said(mocks.warn.mock.calls, '无法定位')).toContain('tool');
+    expect(mocks.warn.mock.calls[0]?.[0]).toContain('无法定位');
+    expect(mocks.warn.mock.calls[0]?.[0]).toContain('tool');
     expect(said(mocks.info.mock.calls, 'pnpm setup')).toBeDefined();
   });
 
