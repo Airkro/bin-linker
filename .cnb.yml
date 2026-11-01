@@ -36,9 +36,6 @@ patch:
         # corepack 的 shim 落在 PNPM_HOME/bin，真实 pnpm 在 COREPACK_HOME/v1/pnpm/<版本>/bin：
         # 两个 bin 都在 PATH 里，既满足 pnpm 10/11/12 的 PATH 校验，shim 也不会指向自己
         PATH: /home/.share/pnpm/bin:/home/.share/pnpm:/home/.share/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      # 下载慢的根因是网络（见上面的 registry），镜像解决之后 timeout 只是兜底：
-      # 真挂住时别再干等 10 分钟才报错。timeout 同时抬高「无输出超时」与「最长执行时间」。
-      timeout: 30m
       stages:
         # node 官方镜像从 25 起不再自带 corepack，从 npm 取一份（走 NPM_CONFIG_REGISTRY 的镜像），
         # 再软链出 pnpm。不直接 `npm i -g pnpm`：pnpm 10 起要求自身的 bin 目录在 PATH 里，
@@ -58,6 +55,9 @@ patch:
         # 顺带一条铁律：corepack 首次安装时要在 TTY 上问「是否下载」，CI 里无人应答会挂死，
         # 所以 env 里关掉了 prompt，这里再显式指定版本，别让它去猜。
         - name: 预装 pnpm
+          # 下载慢的根因是网络（见上面的 registry），镜像解决之后 timeout 只是兜底：
+          # 真挂住时别再干等 10 分钟才报错。timeout 同时抬高「无输出超时」与「最长执行时间」。
+          timeout: 30m
           script: |
             pnpm_version=$(node -p "require('./package.json').packageManager.split('@')[1]")
             echo "corepack installing pnpm@$pnpm_version from $COREPACK_NPM_REGISTRY"
