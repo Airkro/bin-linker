@@ -91,34 +91,25 @@ patch:
           script: |
             node ./lib/index.mjs miniprogram-ci
             echo "== 诊断 =="
+            echo "PNPM_HOME=$PNPM_HOME"
             ls -l "$PNPM_HOME/global/v11" || true
             G=$(ls -d "$PNPM_HOME"/global/v11/*/ | head -1)
-            echo "== $G/node_modules =="
-            ls "$G/node_modules" | head -20
-            echo "== .pnpm 里有什么 =="
-            ls "$G/node_modules/.pnpm" | head -10
-            echo "== 真实包位置 =="
-            readlink -f "$G/node_modules/miniprogram-ci"
-            echo "== 真实包旁边 =="
+            echo "== $G node_modules =="
+            ls "$G/node_modules" | head -10
+            echo "== 真实包所在层 =="
             P=$(readlink -f "$G/node_modules/miniprogram-ci")
-            ls "$(dirname "$P")" | head -20
-            ls "$P/node_modules" 2>/dev/null | head -5 || echo "(包自己没有 node_modules)"
-            echo "== 找 moment =="
-            find "$PNPM_HOME/global" -maxdepth 6 -name "moment" -type d 2>/dev/null | head -5
-            find "$PNPM_HOME/global" -maxdepth 6 -name "moment-timezone" -type d 2>/dev/null | head -5
-            node -e "
-              const { getLayout } = await import('./lib/layout.mjs');
-              const { readDir } = await import('./lib/fs.mjs');
-              const { planPackageLinks } = await import('./lib/plan.mjs');
-              const { layers } = await getLayout();
-              for (const l of layers) {
-                const n = l.depot ? (await readDir(l.depot)).length : -1;
-                console.log('LAYER', l.pkgDir, 'depot=', l.depot, n);
-              }
-              const plan = await planPackageLinks('miniprogram-ci', process.cwd());
-              console.log('PKGDIR', plan.pkgDir);
-              console.log('DEPS', plan.deps?.length, 'moment', plan.deps?.some(d => d.link.endsWith('/moment')));
-            " --input-type=module || true
+            B=$(dirname "$P")
+            echo "$B"
+            ls "$B" | grep -i moment || echo "(同级没有 moment*)"
+            echo "== moment 在哪 =="
+            find "$PNPM_HOME/store" -maxdepth 5 -name "moment" -type d 2>/dev/null | head -3
+            echo "== moment-timezone 的上级 =="
+            T=$(readlink -f "$B/moment-timezone" 2>/dev/null)
+            dirname "$(dirname "$T")" 2>/dev/null
+            ls "$(dirname "$(dirname "$T")")" 2>/dev/null | grep -i moment
+            echo "== node 解析 =="
+            node -e "const r=require('module').createRequire('$P/dist/ci/miniapp/upload.js'); try{console.log(r.resolve('moment'))}catch(e){console.log('FAIL', e.message.split(String.fromCharCode(10))[0])}" || true
+            node -e "const r=require('module').createRequire('$P/dist/ci/miniapp/upload.js'); try{console.log(r.resolve('moment-timezone'))}catch(e){console.log('FAIL')}" || true
         # miniprogram-ci 没有 -v 参数，`npx --no miniprogram-ci -v` 拿到的是 npx 自身的版本，
         # 这里改为校验链接本身：软链存在、且用 node 执行时走到了它自己的入口。
         # 只认「projectPath should not be empty」这一句，不看退出码——以它那套参数校验打头，
