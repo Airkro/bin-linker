@@ -27,7 +27,7 @@ const { run } = await import('../src/cli.mts');
 
 /** 用给定结果跑一次 CLI */
 async function runWith(results: unknown[]): Promise<number> {
-  mocks.linkPackageBins.mockResolvedValue({ results });
+  mocks.linkPackageBins.mockResolvedValue(results);
 
   return run();
 }

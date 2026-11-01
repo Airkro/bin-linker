@@ -62,26 +62,20 @@ function report({ pkg, commands = [], errors, ...rest }: PkgResult): number {
 }
 
 /**
- * 把工程内的绝对路径还原成相对路径。
+ * argv 里的一个入参 → 包名。
  *
  * 脚本里 `$(pwd)/node_modules/xxx` 这种写法很常见，但 `node_modules` 的实际位置
- * 是按包名拼的，留着绝对路径只会解析不到。只挑工程内的：工程外的保持原样，
- * 别把它变成一串 `../..`。
+ * 是按包名拼的，留着绝对路径只会解析不到：工程内的先还原成相对路径（别留一串 `../..`），
+ * 再取最后那几段（`@scope` 一起带上）。
  */
-function makeRelative(arg: string): string {
+function readArg(arg: string): string {
   if (!isAbsolute(arg)) {
-    return arg;
+    return toPkgName(arg);
   }
 
-  // Windows 上盘符大小写、大小写不敏感都可能让前缀比较失手，交给 relative 归一
   const rel = relative(process.cwd(), arg);
 
-  return rel && !rel.startsWith('..') ? rel : arg;
-}
-
-/** argv 里的一个入参 → 包名。先按相对路径归一，再取最后那几段（`@scope` 一起带上） */
-function readArg(arg: string): string {
-  return toPkgName(makeRelative(arg));
+  return rel && !rel.startsWith('..') ? toPkgName(rel) : toPkgName(arg);
 }
 
 /** 链接 argv 里的包，把结果写进日志，并给出退出码 */
@@ -108,7 +102,7 @@ export async function run(): Promise<number> {
   let results: PkgResult[];
 
   try {
-    ({ results } = await linkPackageBins(packages));
+    results = await linkPackageBins(packages);
   } catch (error) {
     return reportSystemError(error as NodeJS.ErrnoException);
   }

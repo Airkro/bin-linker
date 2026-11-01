@@ -30,6 +30,7 @@ const {
   linkPointsTo,
   localBinDir,
   readPackageJson,
+  tryLink,
 } = await import('../src/fs.mts');
 
 const LINK = '/project/node_modules/.bin/tool';
@@ -92,7 +93,7 @@ describe('filesystem helpers', () => {
     );
 
     // 第一次链这个包时目标位置本来就没有东西，unlink 报 ENOENT 不算失败
-    await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
+    await expect(createSymlink(LINK, [TARGET])).resolves.toBeUndefined();
     expect(mocks.unlink).toHaveBeenCalledWith(LINK);
     expect(mocks.symlink).toHaveBeenCalledWith(
       TARGET,
@@ -107,7 +108,7 @@ describe('filesystem helpers', () => {
     // readlink 先拿字面路径去比（省一次 realpath）——这里让字面路径就对得上
     readingOnly({ [LINK]: TARGET });
 
-    await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
+    await createSymlink(LINK, [TARGET]);
     expect(mocks.unlink).not.toHaveBeenCalled();
     expect(mocks.symlink).not.toHaveBeenCalled();
   });
@@ -139,7 +140,7 @@ describe('filesystem helpers', () => {
 
     await expect(linkPointsTo(LINK, [TARGET])).resolves.toBe(false);
 
-    await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
+    await createSymlink(LINK, [TARGET]);
     expect(mocks.unlink).toHaveBeenCalledWith(LINK);
     expect(mocks.symlink).toHaveBeenCalledWith(
       TARGET,
@@ -159,7 +160,7 @@ describe('filesystem helpers', () => {
     mocks.realpath.mockImplementation(gone);
 
     await expect(linkPointsTo(LINK, [TARGET])).resolves.toBe(false);
-    await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
+    await createSymlink(LINK, [TARGET]);
     expect(gone).toHaveBeenCalled();
     expect(mocks.symlink).toHaveBeenCalled();
   });
@@ -173,7 +174,7 @@ describe('filesystem helpers', () => {
     await expect(
       linkPointsTo('/project/node_modules/tool', [TARGET]),
     ).resolves.toBe(false);
-    await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
+    await createSymlink(LINK, [TARGET]);
     expect(mocks.symlink).toHaveBeenCalled();
   });
 
@@ -195,5 +196,13 @@ describe('filesystem helpers', () => {
     await expect(createSymlink(LINK, [TARGET])).rejects.toThrow(
       'cannot unlink',
     );
+  });
+
+  it('turns link failures into a false result', async () => {
+    // 附赠的那几层只关心「有没有补上」，不往外冒错
+    await expect(tryLink(LINK, [TARGET])).resolves.toBe(true);
+
+    mocks.symlink.mockRejectedValueOnce(new Error('cross-device link'));
+    await expect(tryLink(LINK, [TARGET])).resolves.toBe(false);
   });
 });

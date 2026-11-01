@@ -16,17 +16,13 @@ vi.mock('node:fs', () => ({
   promises: { readdir: mocks.readdir, stat: mocks.stat },
 }));
 
-// 布局根与查询结果都按模块实例记忆化，布局相关的用例各取一份隔离实例
-const {
-  getPnpmGlobalPath,
-  getPnpmHome,
-  isPnpmBinDirMissingFromPath,
-  pnpmGlobalRoot,
-  toPkgName,
-} = await import('../src/pnpm.mts');
+type Pnpm = typeof import('../src/pnpm.mts');
 
-const GLOBAL_NODE_MODULES = '/global/node_modules';
+const { getPnpmHome, pnpmGlobalRoot, toPkgName } =
+  await import('../src/pnpm.mts');
+
 const isDir = { isDirectory: () => true };
+const isFile = { isDirectory: () => false };
 const isDirWithMtime = (mtimeMs: number) => ({
   isDirectory: () => true,
   mtimeMs,
@@ -35,10 +31,10 @@ const isDirWithMtime = (mtimeMs: number) => ({
 /**
  * 隔离加载一份模块。
  *
- * 查询结果与布局根都按模块实例记忆化，换一份实例就是从头问一遍；
+ * 查询结果、布局根与依赖表都按模块实例记忆化，换一份实例就是从头问一遍；
  * 每个用例自己声明一份，vitest 会按依赖图各自去重。
  */
-const load = () => import('../src/pnpm.mts');
+const load = (): Promise<Pnpm> => import('../src/pnpm.mts');
 
 /** 环境变量名来自用例自己的表，删除只能用动态键 */
 // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
@@ -74,9 +70,24 @@ async function withEnv(
   }
 }
 
+/** 用一张「路径 → stat 结果」的表充当文件系统，表外的路径一律不存在 */
+function fakeFs(
+  tree: Record<string, { isDirectory: () => boolean; mtimeMs?: number }>,
+) {
+  mocks.stat.mockImplementation(async (dir: string) => {
+    const entry = tree[dir];
+
+    if (!entry) {
+      throw new Error(`missing: ${dir}`);
+    }
+
+    return entry;
+  });
+}
+
 describe('pnpm global layout', () => {
   // 查询结果与布局根都按模块实例记忆化，每条用例都要从头问一遍
-  let api: typeof import('../src/pnpm.mts');
+  let api: Pnpm;
 
   beforeEach(async () => {
     // 记忆化按模块实例走，每个用例都从一份干净的实例开始
@@ -156,7 +167,9 @@ describe('pnpm global layout', () => {
           },
         );
 
-        expect(getPnpmGlobalPath()).toBe('/pnpm-home/global/v11/node_modules');
+        expect(api.getPnpmGlobalPath()).toBe(
+          '/pnpm-home/global/v11/node_modules',
+        );
         // 查询时改过的环境必须原样还回去，别污染调用方
         expect(process.env.npm_config_global_bin_dir).toBe('/elsewhere/bin');
         expect(process.env.CI).toBeUndefined();
@@ -166,7 +179,7 @@ describe('pnpm global layout', () => {
   });
 
   it('does not need an inherited PATH to query the global root', async () => {
-    await withEnv({ PATH: undefined, PNPM_HOME: undefined }, async () => {
+    await withEnv({ PATH: undefined, PNPM_HOME: undefined }, () => {
       expect(api.getPnpmGlobalPath()).toBe('/global/node_modules');
       // 补出来的 PATH 是给子进程看的，进程自己的环境得原样留着
       expect(process.env.PATH).toBeUndefined();
@@ -192,6 +205,13 @@ describe('pnpm global layout', () => {
     expect(empty.getPnpmGlobalPath()).toBe('');
   });
 
+  it('asks pnpm only once per process', async () => {
+    api.getPnpmGlobalPath();
+    api.getPnpmGlobalPath();
+
+    expect(mocks.execSync).toHaveBeenCalledTimes(1);
+  });
+
   it('returns null when pnpm cannot be queried', async () => {
     mocks.execSync.mockImplementation(() => {
       throw new Error('pnpm not found');
@@ -205,37 +225,49 @@ describe('pnpm global layout', () => {
       { PNPM_HOME: '/pnpm-home', npm_config_global_bin_dir: undefined },
       () => {
         process.env.PATH = ['/usr/bin', '/pnpm-home/bin'].join(path.delimiter);
-        expect(isPnpmBinDirMissingFromPath()).toBe(false);
+        expect(api.isBinDirMissingFromPath()).toBe(false);
 
         // PNPM_HOME 本身也在 pnpm 的校验范围内
         process.env.PATH = '/pnpm-home';
-        expect(isPnpmBinDirMissingFromPath()).toBe(false);
+        expect(api.isBinDirMissingFromPath()).toBe(false);
 
         process.env.PATH = '/usr/bin';
-        expect(isPnpmBinDirMissingFromPath()).toBe(true);
+        expect(api.isBinDirMissingFromPath()).toBe(true);
 
         // pnpm 传给子进程的变量优先于 PNPM_HOME
         process.env.npm_config_global_bin_dir = '/elsewhere/bin';
         process.env.PATH = '/elsewhere/bin';
-        expect(isPnpmBinDirMissingFromPath()).toBe(false);
+        expect(api.isBinDirMissingFromPath()).toBe(false);
 
         // 没有 PATH 时按空串处理
         removeEnv('PATH');
-        expect(isPnpmBinDirMissingFromPath()).toBe(true);
+        expect(api.isBinDirMissingFromPath()).toBe(true);
       },
     );
   });
 
   it('looks for the package in both places of every layout root', async () => {
-    // `pnpm root -g` 给的就是 node_modules 那一层：直接依赖的位置先命中
-    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([
-      path.join(GLOBAL_NODE_MODULES, 'tool'),
+    // 直接依赖与平铺表里各有一份：两处都算候选，顺序按「直接依赖优先」
+    fakeFs({
+      [path.join('/global', 'node_modules', 'tool')]: isDir,
+      [path.join('/global', 'node_modules', '.pnpm', 'node_modules', 'tool')]:
+        isDir,
+    });
+
+    // `pnpm root -g` 给的就是 node_modules 那一层
+    await expect(api.findPackageDirs('tool')).resolves.toEqual([
+      path.join('/global/node_modules', 'tool'),
+      path.join('/global/node_modules', '.pnpm', 'node_modules', 'tool'),
     ]);
 
     // 每层只看两处固定位置：直接依赖与平铺表，都不扫目录
     expect(mocks.stat).toHaveBeenNthCalledWith(
       1,
-      path.join(GLOBAL_NODE_MODULES, 'tool'),
+      path.join('/global/node_modules', 'tool'),
+    );
+    expect(mocks.stat).toHaveBeenNthCalledWith(
+      2,
+      path.join('/global/node_modules', '.pnpm', 'node_modules', 'tool'),
     );
     // 版本根只在布局那一步读一次，后面的解析不再读任何目录
     expect(mocks.readdir).toHaveBeenCalledTimes(1);
@@ -245,48 +277,34 @@ describe('pnpm global layout', () => {
   it('finds hoisted indirect dependencies in the flattened table', async () => {
     // 间接依赖常常只出现在 <层>/node_modules/.pnpm/node_modules 这一层
     const hoisted = path.join(
-      GLOBAL_NODE_MODULES,
+      '/global',
+      'node_modules',
       '.pnpm',
       'node_modules',
       'tool',
     );
 
-    mocks.stat.mockImplementation(async (dir: string) => {
-      if (dir === hoisted) {
-        return isDir;
-      }
+    fakeFs({ [hoisted]: isDir });
 
-      throw new Error('missing');
-    });
-
-    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([hoisted]);
+    await expect(api.findPackageDirs('tool')).resolves.toEqual([hoisted]);
   });
 
   it('scans version dirs newest first and tolerates unreadable ones', async () => {
     const versionDir = (name: string) => path.join(pnpmGlobalRoot, name);
-    const expected = path.join(versionDir('alpha'), 'node_modules', 'tool');
 
     mocks.execSync.mockReturnValue('');
     mocks.readdir.mockImplementation(async (dir: string) =>
       dir === pnpmGlobalRoot ? ['zeta', 'alpha', 'broken'] : [],
     );
-    mocks.stat.mockImplementation(async (dir: string) => {
-      if (dir === expected) {
-        return isDir;
-      }
-
-      if (dir === versionDir('zeta')) {
-        return isDirWithMtime(300);
-      }
-
-      if (dir === versionDir('alpha')) {
-        return isDirWithMtime(200);
-      }
-
-      throw new Error('vanished');
+    fakeFs({
+      [path.join(versionDir('zeta'))]: isDirWithMtime(300),
+      [path.join(versionDir('alpha'))]: isDirWithMtime(200),
+      [path.join(versionDir('alpha'), 'node_modules', 'tool')]: isDir,
     });
 
-    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([expected]);
+    await expect(api.findPackageDirs('tool')).resolves.toEqual([
+      path.join(versionDir('alpha'), 'node_modules', 'tool'),
+    ]);
 
     const searched = mocks.stat.mock.calls.map(([dir]) => String(dir));
     const layerOrder = ['zeta', 'alpha'].map((name) =>
@@ -304,8 +322,12 @@ describe('pnpm global layout', () => {
     mocks.readdir.mockImplementation(async (dir: string) =>
       dir === pnpmGlobalRoot ? ['v11'] : [],
     );
+    fakeFs({
+      [versionDir]: isDirWithMtime(1),
+      [path.join(versionDir, 'node_modules', 'tool')]: isDir,
+    });
 
-    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([
+    await expect(api.findPackageDirs('tool')).resolves.toEqual([
       path.join(versionDir, 'node_modules', 'tool'),
     ]);
 
@@ -319,25 +341,24 @@ describe('pnpm global layout', () => {
   it('finds the package inside a content-addressed dir', async () => {
     // pnpm 11：版本根下是哈希目录，包在 <hash>/node_modules/<pkg>
     const versionDir = path.join(pnpmGlobalRoot, 'v11');
-    const expected = path.join(versionDir, 'hash123', 'node_modules', 'tool');
+    const hashDir = path.join(versionDir, 'hash123');
+    const expected = path.join(hashDir, 'node_modules', 'tool');
 
     mocks.execSync.mockReturnValue('');
-    mocks.readdir.mockImplementation(async (dir: string) =>
-      dir === pnpmGlobalRoot ? ['v11'] : ['hash123'],
-    );
-    mocks.stat.mockImplementation(async (dir: string) => {
-      if (dir === versionDir || dir === path.join(versionDir, 'hash123')) {
-        return isDirWithMtime(1);
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      if (dir === pnpmGlobalRoot) {
+        return ['v11'];
       }
 
-      if (dir === expected) {
-        return isDir;
-      }
-
-      throw new Error('missing');
+      return dir === versionDir ? ['hash123'] : [];
+    });
+    fakeFs({
+      [versionDir]: isDirWithMtime(1),
+      [hashDir]: isDirWithMtime(1),
+      [expected]: isDir,
     });
 
-    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([expected]);
+    await expect(api.findPackageDirs('tool')).resolves.toEqual([expected]);
   });
 
   it('ignores version entries that are files', async () => {
@@ -346,19 +367,12 @@ describe('pnpm global layout', () => {
     mocks.readdir.mockImplementation(async (dir: string) =>
       dir === pnpmGlobalRoot ? ['manifest.json', 'v11'] : [],
     );
-    mocks.stat.mockImplementation(async (dir: string) => {
-      if (dir === path.join(pnpmGlobalRoot, 'manifest.json')) {
-        return { isDirectory: () => false };
-      }
-
-      if (dir === path.join(pnpmGlobalRoot, 'v11')) {
-        return isDirWithMtime(1);
-      }
-
-      throw new Error('missing');
+    fakeFs({
+      [path.join(pnpmGlobalRoot, 'manifest.json')]: isFile,
+      [path.join(pnpmGlobalRoot, 'v11')]: isDirWithMtime(1),
     });
 
-    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([]);
+    await expect(api.findPackageDirs('tool')).resolves.toEqual([]);
   });
 
   it('treats an unreadable global root as empty', async () => {
@@ -366,7 +380,7 @@ describe('pnpm global layout', () => {
     mocks.stat.mockRejectedValue(new Error('missing'));
     mocks.readdir.mockRejectedValue(new Error('permission denied'));
 
-    await expect(api.resolveGlobalPkgDirs('ghost')).resolves.toEqual([]);
+    await expect(api.findPackageDirs('ghost')).resolves.toEqual([]);
     expect(mocks.readdir).toHaveBeenCalledWith(pnpmGlobalRoot);
   });
 
@@ -374,15 +388,9 @@ describe('pnpm global layout', () => {
     // `pnpm root -g` 直接给到 <版本目录>/node_modules：别再套一层 node_modules
     mocks.execSync.mockReturnValue('/global/10/node_modules\n');
     mocks.readdir.mockResolvedValue([]);
-    mocks.stat.mockImplementation(async (dir: string) => {
-      if (dir === path.join('/global/10/node_modules', 'tool')) {
-        return isDir;
-      }
+    fakeFs({ [path.join('/global/10/node_modules', 'tool')]: isDir });
 
-      throw new Error('missing');
-    });
-
-    await expect(api.resolveGlobalPkgDirs('tool')).resolves.toEqual([
+    await expect(api.findPackageDirs('tool')).resolves.toEqual([
       path.join('/global/10/node_modules', 'tool'),
     ]);
   });
@@ -418,19 +426,13 @@ describe('pnpm global layout', () => {
 
       return dir === versionDir ? ['hash123'] : [];
     });
-    mocks.stat.mockImplementation(async (dir: string) => {
-      if (dir === depot) {
-        return isDir;
-      }
-
-      if (dir === versionDir || dir === path.join(versionDir, 'hash123')) {
-        return isDirWithMtime(1);
-      }
-
-      throw new Error('missing');
+    fakeFs({
+      [versionDir]: isDirWithMtime(1),
+      [path.join(versionDir, 'hash123')]: isDirWithMtime(1),
+      [depot]: isDir,
     });
 
-    await expect(api.resolveGlobalDepotDir()).resolves.toBe(depot);
+    await expect(api.resolveDepotDir()).resolves.toBe(depot);
   });
 
   it('prefers the dependency table of the newest layout root', async () => {
@@ -442,34 +444,17 @@ describe('pnpm global layout', () => {
     mocks.readdir.mockImplementation(async (dir: string) =>
       dir === pnpmGlobalRoot ? ['v11'] : ['older', 'newer'],
     );
-    mocks.stat.mockImplementation(async (dir: string) => {
+    fakeFs({
       // 版本目录自身的 node_modules 在这里不存在，只有哈希目录下面那层有依赖表
-      if (
-        [
-          path.join(newer, 'node_modules'),
-          path.join(older, 'node_modules'),
-        ].includes(dir)
-      ) {
-        return isDir;
-      }
-
-      if (dir === versionDir) {
-        return isDirWithMtime(1);
-      }
-
-      if (dir === path.join(versionDir, 'newer')) {
-        return isDirWithMtime(20);
-      }
-
-      if (dir === path.join(versionDir, 'older')) {
-        return isDirWithMtime(10);
-      }
-
-      throw new Error('missing');
+      [path.join(newer, 'node_modules')]: isDir,
+      [path.join(older, 'node_modules')]: isDir,
+      [versionDir]: isDirWithMtime(1),
+      [path.join(versionDir, 'newer')]: isDirWithMtime(20),
+      [path.join(versionDir, 'older')]: isDirWithMtime(10),
     });
 
     // 每装一次都可能多一张表，新到旧地排着，谁先谁后由 mtime 决定
-    await expect(api.resolveGlobalDepotDir()).resolves.toBe(
+    await expect(api.resolveDepotDir()).resolves.toBe(
       path.join(newer, 'node_modules'),
     );
   });
@@ -477,6 +462,6 @@ describe('pnpm global layout', () => {
   it('returns null when no layout root exposes a dependency table', async () => {
     mocks.stat.mockRejectedValue(new Error('missing'));
 
-    await expect(api.resolveGlobalDepotDir()).resolves.toBeNull();
+    await expect(api.resolveDepotDir()).resolves.toBeNull();
   });
 });

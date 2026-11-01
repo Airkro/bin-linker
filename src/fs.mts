@@ -15,24 +15,22 @@ export function getLinkType(
   target?: string,
   platform = process.platform,
 ): 'file' | 'junction' | undefined {
-  if (platform !== 'win32') {
-    return undefined;
-  }
-
-  return target && path.extname(target) ? 'file' : 'junction';
+  return platform === 'win32'
+    ? target && path.extname(target)
+      ? 'file'
+      : 'junction'
+    : undefined;
 }
 
 /** 链接落在工程自己的 `node_modules` 里，与包管理器装出来的一致 */
-export const localBinDir = path.resolve(process.cwd(), 'node_modules', '.bin');
+export const projectDir = process.cwd();
+export const localBinDir = path.join(projectDir, 'node_modules', '.bin');
 
 export async function ensureDir(dir: string): Promise<boolean> {
-  try {
-    await fs.mkdir(dir, { recursive: true });
-
-    return true;
-  } catch {
-    return false;
-  }
+  return fs.mkdir(dir, { recursive: true }).then(
+    () => true,
+    () => false,
+  );
 }
 
 /** 不存在的链接当它已经删掉了 */
@@ -60,7 +58,10 @@ async function resolveTargets(targets: string[]): Promise<string[]> {
  * 确认它没断：两边都解析不到就退回字面路径去比，一个指向同一路径的空壳会正好对得上，
  * 于是永远不重建。所以链接那一侧解析失败时一律判否。
  */
-export async function linkPointsTo(link: string, targets: string[]): Promise<boolean> {
+export async function linkPointsTo(
+  link: string,
+  targets: string[],
+): Promise<boolean> {
   const current = await fs.readlink(link).catch(() => null);
 
   // 不存在、或压根不是链接（普通目录会 EINVAL）：都算「要重建」
@@ -74,8 +75,10 @@ export async function linkPointsTo(link: string, targets: string[]): Promise<boo
   }
 
   // 解析不到就说明这是个空壳（目标已经没了），别拿字面路径去比——那样正好对得上，永远不重建
-  const realLink = await fs.realpath(link).catch(() => current);
-  const realTargets = await resolveTargets(targets);
+  const [realLink, realTargets] = await Promise.all([
+    fs.realpath(link).catch(() => current),
+    resolveTargets(targets),
+  ]);
 
   return realTargets.includes(realLink);
 }
@@ -83,23 +86,34 @@ export async function linkPointsTo(link: string, targets: string[]): Promise<boo
 /**
  * 把 `link` 指向 `targets` 里第一个能用的那一份，已经指着其中任意一份就跳过。
  *
- * `targets` 是同一个东西的多个候选安装位置（包可能同时留在几个版本目录里），
+ * `targets` 是同一个东西的多个候选位置（包可能同时留在几个版本目录里），
  * 判定与写入都只在这一处，别处不要再自己读一遍链接。
  */
 export async function createSymlink(
   link: string,
   targets: string[],
-): Promise<boolean> {
+): Promise<void> {
   // 重跑、`pnpm <cmd>` 前置钩子里链接已就位是常态，而 unlink + symlink 是两次写操作，
   // 还会让链接短暂消失
   if (await linkPointsTo(link, targets)) {
-    return true;
+    return;
   }
 
   await unlinkIfPresent(link);
   await fs.symlink(targets[0] as string, link, getLinkType(targets[0]));
+}
 
-  return true;
+/**
+ * 链不上就把错误吞掉算 false，链上了算 true。
+ *
+ * 链接本身已经建好的那份（命令、包本体）要把错误往上冒；
+ * 附赠的那几层（补依赖）在意的是「有没有补上」，只取这个结果。
+ */
+export function tryLink(link: string, targets: string[]): Promise<boolean> {
+  return createSymlink(link, targets).then(
+    () => true,
+    () => false,
+  );
 }
 
 /** package.json 里用得着的那几个字段 */
@@ -111,14 +125,8 @@ export type PackageMeta = {
 export async function readPackageJson(
   pkgDir: string,
 ): Promise<PackageMeta | null> {
-  try {
-    const content = await fs.readFile(
-      path.join(pkgDir, 'package.json'),
-      'utf8',
-    );
-
-    return JSON.parse(content) as PackageMeta;
-  } catch {
-    return null;
-  }
+  return fs
+    .readFile(path.join(pkgDir, 'package.json'), 'utf8')
+    .then((content) => JSON.parse(content) as PackageMeta)
+    .catch(() => null);
 }
