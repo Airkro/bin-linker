@@ -77,22 +77,26 @@ export type PnpmLayout = {
 };
 
 /**
- * 某一层里「全部已装包」平铺在哪。
+ * 某一层里「全部已装包」平铺在哪，返回能找到的全部，顺序即优先级。
  *
- * 两处都算：pnpm 10/11 平铺在 `.pnpm/node_modules`，pnpm 12 起改成 public hoist 到
- * 布局根自己的 `node_modules` 顶层，同时留一个空的 `.pnpm/node_modules` 空壳。
- * 只认「目录在不在」会挑中空壳。
+ * pnpm 10/11 平铺在 `.pnpm/node_modules`，pnpm 12 起 public hoist 到布局根自己的
+ * `node_modules` 顶层，同时**留着一份** `.pnpm/node_modules`：两份都是真的。
+ * 所以不能挑一个了事——顶层那份只有直接装的几个包，间接依赖（miniprogram-ci 的 moment）
+ * 只在 `.pnpm/node_modules` 里。只认「目录在不在」会挑中空壳，只认第一个非空的则会把
+ * 大半张表漏掉。
+ *
+ * 平铺层常与自己那一层是同一个目录，同一个「目录 + 表」去重留给 readLayout 做。
  */
-async function depotIn([nodeModules, nested]: [string, string]): Promise<
-  string | null
+async function depotsIn([nodeModules, nested]: [string, string]): Promise<
+  string[]
 > {
-  for (const dir of [nodeModules, nested]) {
-    if (await hasEntries(dir)) {
-      return dir;
-    }
-  }
+  const found = await Promise.all(
+    [nodeModules, nested].map(async (dir) =>
+      (await hasEntries(dir)) ? dir : null,
+    ),
+  );
 
-  return null;
+  return found.filter((dir) => dir !== null);
 }
 
 async function readLayout(): Promise<PnpmLayout> {
@@ -100,14 +104,27 @@ async function readLayout(): Promise<PnpmLayout> {
   const layers = await Promise.all(
     roots.map(async (root) => {
       const places = layersIn(root);
+      const pkgDir = places[0];
+      const depots = await depotsIn(places);
 
-      return { pkgDir: places[0], depot: await depotIn(places) };
+      // 一个平铺层就是一层：包探到这儿来，缺的依赖就按这层的表算。
+      // 一处都没有时（包可能就待在这层里）也得留这一层，不能凭空消失
+      return (depots.length > 0 ? depots : [null]).map((depot) => ({
+        pkgDir,
+        depot,
+      }));
     }),
   );
 
-  // 不同根可能落到同一层（查询结果就是某个版本目录本身），同一层只留一份
+  // 不同根可能落到同一层（查询结果就是某个版本目录本身），同一个「目录 + 表」只留一份
   return {
-    layers: [...new Map(layers.map((layer) => [layer.pkgDir, layer])).values()],
+    layers: [
+      ...new Map(
+        layers
+          .flat()
+          .map((layer) => [`${layer.pkgDir}\0${layer.depot}`, layer]),
+      ).values(),
+    ],
   };
 }
 

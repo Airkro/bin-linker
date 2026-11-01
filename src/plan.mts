@@ -25,10 +25,10 @@ export type LinkPlan = {
   deps: { link: string; target: string }[];
 };
 
-/** 挑中的那一份包：位置、它自己那一层的依赖表、package.json 里的 bin */
+/** 挑中的那一份包：位置、它自己那几层的依赖表、package.json 里的 bin */
 type Picked = {
   pkgDir: string;
-  depot: string | null;
+  depots: (string | null)[];
   bin?: PackageMeta['bin'];
 };
 
@@ -38,18 +38,23 @@ export type Planned = LinkPlan | LocateFailure;
 /**
  * 从布局的每一层里挑第一个读得到元数据的位置，链断了的那份自动落到下一个。
  *
- * 连同那一层的依赖表一起返回：补依赖得用包自己那层的表，别的层数出来的「缺哪些」不作数。
+ * 连同那几层的依赖表一起返回：补依赖得用包自己那层的表，别的层数出来的「缺哪些」不作数。
  */
 async function pickPackage(
   layers: PnpmLayout['layers'],
   pkg: string,
 ): Promise<Picked | null> {
-  for (const { pkgDir: dir, depot } of layers) {
+  for (const { pkgDir: dir } of layers) {
     const pkgDir = path.join(dir, pkg);
     const pkgJson = await readPackageJson(pkgDir);
 
     if (pkgJson) {
-      return { pkgDir, depot, bin: pkgJson.bin };
+      // 同一个包目录可能因为好几张平铺表各出现一次，表要全带上
+      const depots = layers
+        .filter((layer) => layer.pkgDir === dir)
+        .map((layer) => layer.depot);
+
+      return { pkgDir, depots, bin: pkgJson.bin };
     }
   }
 
@@ -85,6 +90,7 @@ async function planDeps(
     return [];
   }
 
+  // 补在包自己的真实目录里：工程 `node_modules` 里那条链接只是指过去，往链接里写等于改 store
   const realPkgDir = await resolvePath(pkgDir);
   const depsDir = path.join(realPkgDir, 'node_modules');
   const [table, present] = await Promise.all([
@@ -101,6 +107,24 @@ async function planDeps(
 }
 
 /**
+ * 把各层的补全并起来，同一个依赖只补一次。
+ *
+ * 平铺层与自己那一层常是同一个目录，同一个包会从两张表里各算出一遍；两处来源也可能
+ * 各有一份同名依赖（版本不同），先出现的算数——它来自更靠前的那一层。
+ */
+function mergeDeps(...plans: LinkPlan['deps'][]): LinkPlan['deps'] {
+  const deps = new Map<string, LinkPlan['deps'][number]>();
+
+  for (const { link, target } of plans.flat()) {
+    if (!deps.has(link)) {
+      deps.set(link, { link, target });
+    }
+  }
+
+  return [...deps.values()];
+}
+
+/**
  * 算出一个包要做的全部写操作；算不出来就是没装上，返回原因而不抛。
  *
  * `projectDir` 由调用方给：计划只描述「做什么」，不该自己去猜工程在哪。
@@ -111,14 +135,17 @@ export async function planPackageLinks(
 ): Promise<Planned> {
   // 布局与包无关，进程里只算一遍
   const { layers } = await getLayout();
-  const pkgDirs = layers.map(({ pkgDir }) => path.join(pkgDir, pkg));
+  // 同一个包目录可能因为好几张平铺表各出现一次，候选只说位置
+  const pkgDirs = [
+    ...new Set(layers.map(({ pkgDir }) => path.join(pkgDir, pkg))),
+  ];
   const picked = await pickPackage(layers, pkg);
 
   if (!picked) {
     return { pkg, pkgDirs, notFound: true };
   }
 
-  const { pkgDir, depot, bin } = picked;
+  const { pkgDir, depots, bin } = picked;
   const binEntries = bin ? getBinEntries(pkg, bin) : [];
 
   // 没有 bin 的包连本体都不用链：它只提供库，工程里用不着它
@@ -131,6 +158,8 @@ export async function planPackageLinks(
     pkgDirs,
     pkgLink: path.join(projectDir, 'node_modules', pkg),
     binEntries,
-    deps: await planDeps(pkgDir, depot),
+    deps: mergeDeps(
+      ...(await Promise.all(depots.map((depot) => planDeps(pkgDir, depot)))),
+    ),
   };
 }

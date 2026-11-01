@@ -213,6 +213,42 @@ describe('planPackageLinks', () => {
     });
   });
 
+  it('merges the dependency links planned from every hoisted table', async () => {
+    // pnpm 12 会为同一层给出两张平铺表：直接装的包在顶层，间接依赖仍在 `.pnpm/node_modules`。
+    // 只算一张就会漏掉间接依赖，moment 就是这么断的
+    const [hoisted, nested] = [DEPOT_DIR, path.join(DEPOT_DIR, '.pnpm', 'x')];
+
+    mocks.getLayout.mockResolvedValue({
+      layers: [
+        { pkgDir: path.dirname(PKG_DIR), depot: hoisted },
+        { pkgDir: path.dirname(PKG_DIR), depot: nested },
+      ],
+    });
+    mocks.resolvePath.mockResolvedValue(STORE_DIR);
+    mocks.readDir.mockImplementation(async (dir: string) => {
+      if (dir === hoisted) {
+        return ['present-dep', 'top-dep'];
+      }
+
+      return dir === nested ? ['moment', 'top-dep'] : ['present-dep'];
+    });
+
+    await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
+      // 候选只说位置，同一个包目录不重复
+      pkgDirs: [PKG_DIR],
+      deps: [
+        {
+          link: path.join(STORE_DIR, 'node_modules', 'top-dep'),
+          target: path.join(hoisted, 'top-dep'),
+        },
+        {
+          link: path.join(STORE_DIR, 'node_modules', 'moment'),
+          target: path.join(nested, 'moment'),
+        },
+      ],
+    });
+  });
+
   it('falls back to the given directory when the store path cannot be resolved', async () => {
     // realpath 失败（如链接已断）时按原路径继续，别把整次链接拖垮
     mocks.getLayout.mockResolvedValue(

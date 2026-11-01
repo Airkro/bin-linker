@@ -443,6 +443,47 @@ describe('pnpm global layout', () => {
     );
   });
 
+  it('keeps both dependency tables pnpm 12 hoists in one layer', async () => {
+    // pnpm 12 把直接装的包 public hoist 到 `<layer>/node_modules` 顶层，
+    // 同时仍留着一份 `.pnpm/node_modules`：顶层只有直接装的几个，间接依赖（moment）在后面那份里。
+    // 挑一个了事就会漏掉大半张表，补依赖算出来是零，包一 require 就断
+    const globals = path.join(getPnpmHome(), 'global');
+    const version = path.join(globals, 'v11');
+    const hashed = path.join(version, 'abc123');
+    const pkgDir = path.join(hashed, 'node_modules');
+
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      if (dir === globals) {
+        return ['v11'];
+      }
+
+      if (dir === version) {
+        return ['abc123'];
+      }
+
+      return dir === pkgDir || dir === nestedOf(pkgDir) ? ['dep'] : [];
+    });
+    // 版本目录自己的 node_modules 两处候选都不存在，两张表都在哈希目录下面那层
+    mocks.stat.mockReset();
+    fakeFs({
+      [version]: isDirWithMtime(1),
+      [hashed]: isDirWithMtime(2),
+      [pkgDir]: isDirWithMtime(0),
+      [nestedOf(pkgDir)]: isDirWithMtime(0),
+      [path.dirname(pkgDir)]: isDirWithMtime(0),
+    });
+
+    // 两张表都算数；版本目录自己的 node_modules 是空壳，包探不到那儿去
+    await expect(api.getLayout()).resolves.toEqual({
+      layers: [
+        layerOf(version),
+        layerOf(pkgDir, pkgDir),
+        layerOf(pkgDir, nestedOf(pkgDir)),
+      ],
+    });
+  });
+
   it('skips a dependency table that exists but holds nothing', async () => {
     // pnpm 12 把依赖 public hoist 到全局安装根自己的 node_modules 顶层，
     // 同时留下一个空的 `.pnpm/node_modules`：只认「目录在不在」会挑中空壳
