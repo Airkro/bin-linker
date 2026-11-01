@@ -62,7 +62,25 @@ patch:
           script: node ./lib/index.mjs miniprogram-ci
         # miniprogram-ci 没有 -v 参数，`npx --no miniprogram-ci -v` 拿到的是 npx 自身的版本，
         # 这里改为校验链接本身：软链存在、且用 node 执行时能走到它自己的入口。
+        # 入口一启动就先校验参数，抛 projectPath should not be empty——错误发生在
+        # require('moment') 之前，所以这一步绿了也证明不了依赖还在。
         - name: 验证链接结果
           script: |
             test -L node_modules/.bin/miniprogram-ci
             node node_modules/.bin/miniprogram-ci 2>&1 | grep -q 'projectPath should not be empty'
+        # 上一步只验证到「参数校验」，依赖解析是另一回事，单独复现。
+        # 站在 node_modules 里的软链上解析一次 moment——这一步不需要 appid 与私钥，
+        # 也不联网，跑完就能看出 bin-linker 建完软链之后依赖还在不在。
+        - name: 复现 moment 依赖解析
+          script: |
+            node fixtures/moment-repro/check-moment.cjs node_modules/miniprogram-ci
+        # 再加一份工程自备 moment 的对照组：真实小程序工程里往往就装着 moment，
+        # 有它兜着 moment 才解析得到。两组一起才是完整现场。
+        - name: 对照：工程自备 moment
+          script: |
+            rm -rf ./moment-repro-app
+            cp -r fixtures/moment-repro/apps/demo ./moment-repro-app
+            cd ./moment-repro-app
+            npm i --no-audit --no-fund
+            ln -sfn "$(pnpm root -g)/miniprogram-ci" node_modules/miniprogram-ci
+            node ../fixtures/moment-repro/check-moment.cjs node_modules/miniprogram-ci

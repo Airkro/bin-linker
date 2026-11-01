@@ -186,3 +186,6 @@ lib/*
 
 ### pnpm ###
 .pnpm-store/
+
+# CI 里从小工程拷出来的复现目录
+moment-repro-app/
