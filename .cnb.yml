@@ -2,7 +2,8 @@ version: '1.0'
 
 patch:
   push:
-    # 原环境镜像已失效，改用官方镜像 + 手工装 pnpm（node 官方镜像自 25 起不再自带 corepack）。
+    # 原环境镜像已失效，改用官方镜像 + corepack 装 pnpm（node 官方镜像自 25 起不再自带 corepack，
+    # 所以从 npm 取一份 corepack，再用它按 packageManager 字段准备 pnpm 版本）。
     - name: 构建与测试
       runner:
         tags:
@@ -23,26 +24,48 @@ patch:
         PNPM_HOME: /home/.share/pnpm
         NPM_CONFIG_PREFIX: /home/.share/npm
         # 构建机直连 registry.npmjs.org 会卡在下载阶段（静默、随机、时快时慢），
-        # 统一走 npmmirror。写 env 而不是 .npmrc：不影响本地与发布（publishConfig 仍指 npmjs），
+        # 统一走腾讯云镜像。写 env 而不是 .npmrc：不影响本地与发布（publishConfig 仍指 npmjs），
         # 且 npm / pnpm / npx 都读 npm_config_* 变量，一处生效。
-        NPM_CONFIG_REGISTRY: https://registry.npmmirror.com
-        # 指向真实 pnpm 安装目录而不是 bin 目录，既满足 pnpm 10 的 PATH 校验，也不会成环
-        PATH: /home/.share/npm/lib/node_modules/pnpm/bin:/home/.share/pnpm:/home/.share/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        NPM_CONFIG_REGISTRY: https://mirrors.cloud.tencent.com/npm
+        # corepack 不读 .npmrc，裸下 pnpm 时固定走 registry.npmjs.org，镜像必须单独指定：
+        # 它拿这个地址去取 pnpm 的 tarball，和上面的 npm 源是两条独立的下载链路。
+        COREPACK_NPM_REGISTRY: https://mirrors.cloud.tencent.com/npm
+        COREPACK_HOME: /home/.share/corepack
+        # corepack 首次安装 pnpm 时会在 TTY 上问一句「是否下载」，构建里没人应答就会干等到超时
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+        # corepack 的 shim 落在 PNPM_HOME/bin，真实 pnpm 在 COREPACK_HOME/v1/pnpm/<版本>/bin：
+        # 两个 bin 都在 PATH 里，既满足 pnpm 10 的 PATH 校验，shim 也不会指向自己
+        PATH: /home/.share/pnpm/bin:/home/.share/pnpm:/home/.share/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       # 下载慢的根因是网络（见上面的 registry），镜像解决之后 timeout 只是兜底：
       # 真挂住时别再干等 10 分钟才报错。timeout 同时抬高「无输出超时」与「最长执行时间」。
       timeout: 30m
       stages:
-        # 不用 corepack：它没有 packageManager 字段时会去 registry 取 pnpm 最新版，
-        # 下载阶段没有任何输出，会撞上无输出超时（构建 cnb-q73-1k6agsf87）。
-        - name: 安装 pnpm
+        # node 官方镜像从 25 起不再自带 corepack，从 npm 取一份（走 NPM_CONFIG_REGISTRY 的镜像），
+        # 再软链出 pnpm。不直接 `npm i -g pnpm`：pnpm 10 要求自身的 bin 目录在 PATH 里，
+        # 装 pnpm 本体和 shim 落到同一目录会自链成环（曾报 Symbolic link loop）。
+        # 下载链路偶发静默挂住（曾撞上无输出超时，构建 cnb-q73-1k6agsf87），
+        # 用 timeout 兜底：真挂住就尽快失败并打出是哪一步，别干等到天亮。
+        - name: 安装 corepack
+          script: |
+            mkdir -p "$PNPM_HOME/bin"
+            timeout 600 npm i -g corepack || { echo "npm corepack failed"; exit 1; }
+            corepack --version
+            corepack enable --install-directory "$PNPM_HOME/bin"
+        # 先把 pnpm 本体落进 corepack 的 cache：给出版本号而不是范围，
+        # 省掉一次 registry 查询，也不依赖镜像的 dist-tags。
+        # 顺带一条铁律：corepack 首次安装时要在 TTY 上问「是否下载」，CI 里无人应答会挂死，
+        # 所以 env 里关掉了 prompt，这里再显式指定版本，别让它去猜。
+        - name: 预装 pnpm
           script: |
             pnpm_version=$(node -p "require('./package.json').packageManager.split('@')[1]")
-            npm i -g "pnpm@$pnpm_version"
+            echo "corepack installing pnpm@$pnpm_version from $COREPACK_NPM_REGISTRY"
+            timeout 600 corepack install --global "pnpm@$pnpm_version" || { echo "corepack install failed"; exit 1; }
             pnpm -v
-            # 卡住的是下载不是解析，先把这一条钉死在构建日志里。
+            # 下载走的是哪条链路，钉死在构建日志里。
             # 必须经 echo 输出：`npm config get` 的 stdout 不是 TTY 时不写终端，
             # 放在 stage 末尾等于什么都没有，最后一条命令无输出会撞上无输出超时。
             echo "npm registry: $(npm config get registry)"
+            echo "corepack registry: $COREPACK_NPM_REGISTRY"
         - name: 预热 pnpm
           script: |
             pnpm config set store-dir /home/.share/pnpm/store --global
