@@ -2,7 +2,7 @@ version: '1.0'
 
 patch:
   push:
-    # 原有环境镜像已失效，改用官方镜像 + corepack 还原 dockerfile 里的 pnpm 环境
+    # 原环境镜像已失效，改用官方镜像 + 手工装 pnpm（node 官方镜像自 25 起不再自带 corepack）。
     - name: 构建与测试
       runner:
         tags:
@@ -17,25 +17,22 @@ patch:
       # 不能用 $PATH 拼接：声明在 env 里的 PATH 会先参与变量替换，
       # 此时 $PATH 还是空的，冒号后的内容会被当成命令执行。
       env:
-        COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
         XDG_DATA_HOME: /home/.share
         PNPM_HOME: /home/.share/pnpm
         PATH: /home/.share/pnpm/bin:/home/.share/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       stages:
-        # node 官方镜像从 25 起已不再自带 corepack（实测 node:lts-alpine 里 corepack 为 not found），
-        # 这里从 npm 装一份到全局目录，再软链出 corepack/pnpm/pnpx。
-        # 不用 `npm i -g pnpm`：npm 的全局 bin 落在 /usr/local/bin，
-        # 而 pnpm 10 起要求 PNPM_HOME/bin 在 PATH 里才肯执行全局操作，
-        # 两套目录容易对不上，统一用 corepack 按 packageManager 字段准备版本。
-        - name: 安装 corepack
+        # pnpm 10 起要求 PNPM_HOME/bin 在 PATH 里才肯执行全局操作，
+        # 而 npm 的全局 bin 落在 /usr/local/bin，所以显式指定 --prefix 后再软链进 PNPM_HOME/bin。
+        # 不用 corepack：它没有 packageManager 字段时会去 registry 取 pnpm 最新版，
+        # 下载阶段没有任何输出，会撞上 10 分钟无输出超时（构建 cnb-q73-1k6agsf87）。
+        - name: 安装 pnpm
           script: |
             mkdir -p "$PNPM_HOME/bin"
-            npm i -g corepack --prefix /home/.share/corepack
-            ln -sf /home/.share/corepack/lib/node_modules/corepack/dist/corepack.js "$PNPM_HOME/bin/corepack"
-            ln -sf /home/.share/corepack/lib/node_modules/corepack/dist/pnpm.js "$PNPM_HOME/bin/pnpm"
-            ln -sf /home/.share/corepack/lib/node_modules/corepack/dist/pnpx.js "$PNPM_HOME/bin/pnpx"
-        - name: 启用 pnpm
-          script: pnpm -v # 首次运行时会按 packageManager 自动准备 pnpm 版本
+            pnpm_version=$(node -p "require('./package.json').packageManager.split('@')[1]")
+            npm i -g "pnpm@$pnpm_version" --prefix /home/.share/pnpm
+            ln -sf /home/.share/pnpm/bin/pnpm "$PNPM_HOME/bin/pnpm"
+            ln -sf /home/.share/pnpm/bin/pnpx "$PNPM_HOME/bin/pnpx"
+            pnpm -v
         - name: 预热 pnpm
           script: |
             pnpm config set store-dir /home/.share/pnpm/store --global
