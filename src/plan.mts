@@ -6,7 +6,7 @@ import {
   resolvePath,
   type PackageMeta,
 } from './fs.mts';
-import { getLayout } from './layout.mts';
+import { getLayout, type PnpmLayout } from './layout.mts';
 
 /** 可执行文件的名字与其在包里的相对位置 */
 export type BinEntry = [name: string, relPath: string];
@@ -24,6 +24,13 @@ export type LinkPlan = {
   deps: { link: string; target: string }[];
 };
 
+/** 挑中的那一份包：位置、它自己那一层的依赖表、package.json 里的 bin */
+type Picked = {
+  pkgDir: string;
+  depot: string | null;
+  bin?: PackageMeta['bin'];
+};
+
 /**
  * 没装上：包里没有可执行文件，或全局目录里压根找不到它。
  *
@@ -37,15 +44,21 @@ export type LocateFailure = Pick<LinkPlan, 'pkgDirs'> & {
   globalBinDir?: boolean;
 };
 
-/** 从 `pkgDirs` 里挑第一个读得到元数据的位置，链断了的那份自动落到下一个 */
+/**
+ * 从布局的每一层里挑第一个读得到元数据的位置，链断了的那份自动落到下一个。
+ *
+ * 连同那一层的依赖表一起返回：补依赖得用包自己那层的表，别的层数出来的「缺哪些」不作数。
+ */
 async function pickPackage(
-  pkgDirs: string[],
-): Promise<[pkgDir: string, pkgJson: PackageMeta] | null> {
-  for (const pkgDir of pkgDirs) {
+  layers: PnpmLayout['layers'],
+  pkg: string,
+): Promise<Picked | null> {
+  for (const { pkgDir: dir, depot } of layers) {
+    const pkgDir = path.join(dir, pkg);
     const pkgJson = await readPackageJson(pkgDir);
 
     if (pkgJson) {
-      return [pkgDir, pkgJson];
+      return { pkgDir, depot, bin: pkgJson.bin };
     }
   }
 
@@ -73,9 +86,10 @@ function getBinEntries(
  * 「缺哪些」只付两次 readdir：依赖表里列出来的就是这一版 pnpm 认为这个包该看得到的
  * 全部依赖，表里有、包里没有，就是缺。
  */
-async function planDeps(pkgDir: string): Promise<LinkPlan['deps']> {
-  const { depot } = await getLayout();
-
+async function planDeps(
+  pkgDir: string,
+  depot: string | null,
+): Promise<LinkPlan['deps']> {
   if (!depot) {
     return [];
   }
@@ -105,15 +119,15 @@ export async function planPackageLinks(
   projectDir: string,
 ): Promise<LinkPlan | LocateFailure> {
   // 布局与包无关，进程里只算一遍
-  const { candidates } = await getLayout();
-  const pkgDirs = candidates.map((dir) => path.join(dir, pkg));
-  const picked = await pickPackage(pkgDirs);
+  const { layers } = await getLayout();
+  const pkgDirs = layers.map(({ pkgDir }) => path.join(pkgDir, pkg));
+  const picked = await pickPackage(layers, pkg);
 
   if (!picked) {
     return { pkg, pkgDirs, notFound: true };
   }
 
-  const [pkgDir, { bin }] = picked;
+  const { pkgDir, depot, bin } = picked;
   const binEntries = bin ? getBinEntries(pkg, bin) : [];
 
   // 没有 bin 的包连本体都不用链：它只提供库，工程里用不着它
@@ -126,6 +140,6 @@ export async function planPackageLinks(
     pkgDirs,
     pkgLink: path.join(projectDir, 'node_modules', pkg),
     binEntries,
-    deps: await planDeps(pkgDir),
+    deps: await planDeps(pkgDir, depot),
   };
 }

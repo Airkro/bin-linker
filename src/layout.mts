@@ -73,28 +73,51 @@ async function hasEntries(dir: string): Promise<boolean> {
   return stat?.isDirectory() === true && names.length > 0;
 }
 
-/** 布局给出的两份答案：包可能落在哪些目录、依赖表在哪一层 */
+/** 布局给出的一份答案：包可能落在哪些目录，以及每个目录对应的依赖表 */
 export type PnpmLayout = {
-  /** 包可能落在的目录，顺序即优先级 */
-  candidates: string[];
-  /** 「全部已装包」平铺的那一层，包自己够不到的依赖在这里 */
-  depot: string | null;
+  /**
+   * 包可能落在的目录，顺序即优先级；每处都带着自己那一层的依赖表。
+   *
+   * 依赖表不能全进程只挑一个：全局安装根下常有好几层（每装一次多一个内容寻址目录），
+   * 各层各有一张表。拿 mtime 最新那层的表去补另一层的包，缺的依赖永远算不对——
+   * 那层可能只装了零星几个包（CI 上连着跑上百次构建就是这样），
+   * 于是「缺哪些」算出来是零，包一 require 间接依赖就断。
+   */
+  layers: { pkgDir: string; depot: string | null }[];
 };
+
+/**
+ * 某一层里「全部已装包」平铺在哪。
+ *
+ * 两处都算：pnpm 10/11 平铺在 `.pnpm/node_modules`，pnpm 12 起改成 public hoist 到
+ * 布局根自己的 `node_modules` 顶层，同时留一个空的 `.pnpm/node_modules` 空壳。
+ * 只认「目录在不在」会挑中空壳。
+ */
+async function depotIn([nodeModules, nested]: [string, string]): Promise<
+  string | null
+> {
+  for (const dir of [nodeModules, nested]) {
+    if (await hasEntries(dir)) {
+      return dir;
+    }
+  }
+
+  return null;
+}
 
 async function readLayout(): Promise<PnpmLayout> {
   const roots = await findLayoutRoots();
-  const layers = roots.map((root) => layersIn(root));
-  // 依赖表从新到旧找第一个**非空**的。两层都算：pnpm 10/11 平铺在 `.pnpm/node_modules`，
-  // pnpm 12 起改成 public hoist 到布局根自己的 `node_modules` 顶层，同时留一个空的
-  // `.pnpm/node_modules` 空壳。只认「目录在不在」会挑中那个空壳，「缺哪些依赖」永远算成零个，
-  // 包一 require 间接依赖就断（miniprogram-ci 的 moment）。
-  const depots = layers.flat();
-  const filled = await Promise.all(depots.map((dir) => hasEntries(dir)));
-  const index = filled.indexOf(true);
+  const layers = await Promise.all(
+    roots.map(async (root) => {
+      const places = layersIn(root);
 
+      return { pkgDir: places[0], depot: await depotIn(places) };
+    }),
+  );
+
+  // 不同根可能落到同一层（查询结果就是某个版本目录本身），同一层只留一份
   return {
-    candidates: layers.flat(),
-    depot: index === -1 ? null : (depots[index] as string),
+    layers: [...new Map(layers.map((layer) => [layer.pkgDir, layer])).values()],
   };
 }
 

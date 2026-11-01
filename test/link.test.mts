@@ -44,10 +44,15 @@ const commandCalls = () =>
 const depCalls = () =>
   mocks.createSymlink.mock.calls.filter(([link]) => link.startsWith(STORE_DIR));
 
-/** 一份只有这一处候选、没有依赖表的布局 */
-const layout = (candidates: string[] = ['/global/node_modules']) => ({
-  candidates,
-  depot: null,
+/** 一份只有这一层、没有依赖表的布局 */
+const layout = (
+  pkgDirs: string[] = ['/global/node_modules'],
+  depots: (string | null)[] = pkgDirs.map(() => null),
+) => ({
+  layers: pkgDirs.map((pkgDir, index) => ({
+    pkgDir,
+    depot: depots[index] ?? null,
+  })),
 });
 
 describe('planPackageLinks', () => {
@@ -64,10 +69,9 @@ describe('planPackageLinks', () => {
     mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['missing-dep'] : [],
     );
-    mocks.getLayout.mockResolvedValue({
-      candidates: ['/global/node_modules'],
-      depot: DEPOT_DIR,
-    });
+    mocks.getLayout.mockResolvedValue(
+      layout(['/global/node_modules'], [DEPOT_DIR]),
+    );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
 
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toEqual({
@@ -83,6 +87,43 @@ describe('planPackageLinks', () => {
       ],
     });
     expect(mocks.createSymlink).not.toHaveBeenCalled();
+  });
+
+  it('uses the dependency table of the layer the package came from', async () => {
+    // 全局安装根下常有好几层，各层各有一张表。拿最新那层的表去补另一层的包，
+    // 「缺哪些」永远算不对——那层可能只装了零星几个包（CI 上跑上百次构建就是这样）
+    const latestDepot = '/global/cowsay-only/node_modules';
+    const pkgDepot = '/global/miniprogram/node_modules';
+
+    mocks.getLayout.mockResolvedValue(
+      layout(
+        ['/global/cowsay-only', '/global/miniprogram'],
+        [latestDepot, pkgDepot],
+      ),
+    );
+    mocks.readPackageJson.mockImplementation(async (dir: string) =>
+      dir === path.join('/global/miniprogram', PKG)
+        ? { bin: { tool: 'tool.js' } }
+        : null,
+    );
+    mocks.readDir.mockImplementation(async (dir: string) =>
+      dir === pkgDepot ? ['missing-dep'] : [],
+    );
+
+    await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
+      pkgDir: path.join('/global/miniprogram', PKG),
+      deps: [
+        {
+          link: path.join(
+            '/global/miniprogram',
+            PKG,
+            'node_modules',
+            'missing-dep',
+          ),
+          target: path.join(pkgDepot, 'missing-dep'),
+        },
+      ],
+    });
   });
 
   it('keeps the newest candidate first and picks the one with metadata', async () => {
@@ -155,10 +196,9 @@ describe('planPackageLinks', () => {
 
   it('plans nothing to link when the package already has every dependency', async () => {
     // 上一次补过的依赖还在时不该重建：store 是共享的，重建是多余的写操作
-    mocks.getLayout.mockResolvedValue({
-      candidates: [path.dirname(PKG_DIR)],
-      depot: DEPOT_DIR,
-    });
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
     mocks.readDir.mockResolvedValue(['linked-dep']);
 
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
@@ -168,10 +208,9 @@ describe('planPackageLinks', () => {
 
   it('falls back to the given directory when the store path cannot be resolved', async () => {
     // realpath 失败（如链接已断）时按原路径继续，别把整次链接拖垮
-    mocks.getLayout.mockResolvedValue({
-      candidates: [path.dirname(PKG_DIR)],
-      depot: DEPOT_DIR,
-    });
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
     mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['missing-dep'] : [],
     );
@@ -271,10 +310,9 @@ describe('linkPackageBins', () => {
   it('links the dependencies the package does not have', async () => {
     // pnpm 全局布局下包的真实路径在 store 里，够不到全局安装根那张依赖表。
     // 表里有、包里没有的才补，只付两次目录读的代价。
-    mocks.getLayout.mockResolvedValue({
-      candidates: [path.dirname(PKG_DIR)],
-      depot: DEPOT_DIR,
-    });
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
     mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['missing-dep', 'present-dep'] : ['present-dep'],
@@ -297,10 +335,9 @@ describe('linkPackageBins', () => {
   it('prepares the directories the links land in', async () => {
     // 工程可能刚 `npm init`，一个 node_modules 都没有：软链不会替谁建父目录，
     // 缺一层就 ENOENT，报出来还像是「包没装」
-    mocks.getLayout.mockResolvedValue({
-      candidates: [path.dirname(PKG_DIR)],
-      depot: DEPOT_DIR,
-    });
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
     mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['missing-dep'] : [],
@@ -349,10 +386,9 @@ describe('linkPackageBins', () => {
   it('still attempts the links when the directories cannot be created', async () => {
     // 建不成不该挡住链接：真建不出来时建链自己会照实报错
     mocks.ensureDir.mockRejectedValue(new Error('EACCES'));
-    mocks.getLayout.mockResolvedValue({
-      candidates: [path.dirname(PKG_DIR)],
-      depot: DEPOT_DIR,
-    });
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
     mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['missing-dep'] : [],
@@ -364,10 +400,9 @@ describe('linkPackageBins', () => {
   });
 
   it('treats an unreadable dependency table as empty', async () => {
-    mocks.getLayout.mockResolvedValue({
-      candidates: [path.dirname(PKG_DIR)],
-      depot: DEPOT_DIR,
-    });
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
     mocks.readDir.mockResolvedValue([]);
 
     const [result] = await linkPackageBins([PKG]);
@@ -378,10 +413,9 @@ describe('linkPackageBins', () => {
 
   it('keeps going when a dependency link fails', async () => {
     // 补不上某个依赖不该连命令一起丢掉：链接已建好，缺哪个依赖让运行时照实报错
-    mocks.getLayout.mockResolvedValue({
-      candidates: [path.dirname(PKG_DIR)],
-      depot: DEPOT_DIR,
-    });
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
     mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['broken-dep', 'good-dep'] : [],
@@ -400,10 +434,9 @@ describe('linkPackageBins', () => {
   });
 
   it('reports nothing linked when every dependency fails', async () => {
-    mocks.getLayout.mockResolvedValue({
-      candidates: [path.dirname(PKG_DIR)],
-      depot: DEPOT_DIR,
-    });
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
     mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['broken-dep'] : [],

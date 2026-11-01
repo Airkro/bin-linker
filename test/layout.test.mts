@@ -20,7 +20,7 @@ vi.mock('node:fs', () => ({
 
 type Layout = typeof import('../src/layout.mts');
 
-const isDir = { isDirectory: () => true };
+const isDir = { isDirectory: () => true, mtimeMs: 0 };
 const isFile = { isDirectory: () => false };
 const isDirWithMtime = (mtimeMs: number) => ({
   isDirectory: () => true,
@@ -76,17 +76,20 @@ function fakeFs(
 }
 
 /**
- * 一个布局根下包的候选位置：`node_modules` 与 `.pnpm/node_modules`。
- * 根本身就叫 node_modules 时不再套一层（`pnpm root -g` 给的就是那一层）。
+ * 一个布局根给出的那一层：包落在 `node_modules`（根本身就叫 node_modules 时不再套一层，
+ * `pnpm root -g` 给的就是那一层），依赖表默认就在它下面。
  */
-const candidatesOf = (root: string) => {
-  const nodeModules =
+const layerOf = (root: string, depot: string | null = null) => {
+  const pkgDir =
     path.basename(root) === 'node_modules'
       ? root
       : path.join(root, 'node_modules');
 
-  return [nodeModules, path.join(nodeModules, '.pnpm', 'node_modules')];
+  return { pkgDir, depot };
 };
+
+/** 某一层的 `.pnpm/node_modules` */
+const nestedOf = (pkgDir: string) => path.join(pkgDir, '.pnpm', 'node_modules');
 
 describe('pnpm home', () => {
   beforeEach(() => {
@@ -180,13 +183,10 @@ describe('pnpm global layout', () => {
           dir.endsWith('.pnpm/node_modules') ? ['dep'] : [],
         );
 
+        const pkgDir = '/pnpm-home/global/v11/node_modules';
+
         await expect(api.getLayout()).resolves.toEqual({
-          candidates: candidatesOf('/pnpm-home/global/v11/node_modules'),
-          depot: path.join(
-            '/pnpm-home/global/v11/node_modules',
-            '.pnpm',
-            'node_modules',
-          ),
+          layers: [layerOf(pkgDir, nestedOf(pkgDir))],
         });
 
         const [command, options] = mocks.execSync.mock.calls[0] as [
@@ -234,7 +234,7 @@ describe('pnpm global layout', () => {
     );
 
     await expect(api.getLayout()).resolves.toMatchObject({
-      candidates: candidatesOf('/pnpm/global/v11/node_modules'),
+      layers: [layerOf('/pnpm/global/v11/node_modules')],
     });
 
     // 没有以 / 开头的行就用整段输出兜底
@@ -246,10 +246,7 @@ describe('pnpm global layout', () => {
     vi.resetModules();
     mocks.execSync.mockReturnValue('');
     const empty = await load();
-    await expect(empty.getLayout()).resolves.toEqual({
-      candidates: [],
-      depot: null,
-    });
+    await expect(empty.getLayout()).resolves.toEqual({ layers: [] });
   });
 
   it('asks pnpm only once per process', async () => {
@@ -268,16 +265,13 @@ describe('pnpm global layout', () => {
     );
 
     // 查询失败只是一条线索没了，布局还是能靠读盘拼出来
-    await expect(api.getLayout()).resolves.toEqual({
-      candidates: [],
-      depot: null,
-    });
+    await expect(api.getLayout()).resolves.toEqual({ layers: [] });
   });
 
   it('exposes both fixed places of every layout root', async () => {
     // 直接依赖与平铺表各是一处候选，顺序按「直接依赖优先」
     await expect(api.getLayout()).resolves.toMatchObject({
-      candidates: candidatesOf('/global/node_modules'),
+      layers: [layerOf('/global/node_modules')],
     });
   });
 
@@ -300,9 +294,9 @@ describe('pnpm global layout', () => {
 
     // 目录名跟版本号没有约定（pnpm 10 是 `10`，pnpm 11 换成 `v11`），新到旧靠 mtime
     await expect(api.getLayout()).resolves.toMatchObject({
-      candidates: [
-        ...candidatesOf(path.join(globals, 'v11')),
-        ...candidatesOf(path.join(globals, '10')),
+      layers: [
+        layerOf(path.join(globals, 'v11')),
+        layerOf(path.join(globals, '10')),
       ],
     });
   });
@@ -316,9 +310,13 @@ describe('pnpm global layout', () => {
       dir === globals ? ['v11'] : [],
     );
 
-    await expect(api.getLayout()).resolves.toMatchObject({
-      candidates: candidatesOf(path.join(version, 'node_modules')),
-    });
+    // 查询结果常就是某个版本目录，不能把同一份布局探两遍（层内 `.pnpm/node_modules`
+    // 那种子目录也算一层根，所以按 pkgDir 去重）
+    const { layers } = await api.getLayout();
+
+    expect(new Set(layers.map(({ pkgDir }) => pkgDir)).size).toBe(
+      layers.length,
+    );
   });
 
   it('finds packages inside a content-addressed dir', async () => {
@@ -343,7 +341,7 @@ describe('pnpm global layout', () => {
     // pnpm 11 把包放在内容寻址的哈希目录下，比版本目录再深一层；
     // 版本目录本身仍是候选（包装在它自己下面时也在那儿）
     await expect(api.getLayout()).resolves.toMatchObject({
-      candidates: [...candidatesOf(version), ...candidatesOf(hashed)],
+      layers: [layerOf(version), layerOf(hashed)],
     });
   });
 
@@ -361,8 +359,7 @@ describe('pnpm global layout', () => {
     });
 
     await expect(api.getLayout()).resolves.toEqual({
-      candidates: candidatesOf(path.join(globals, 'v11')),
-      depot: null,
+      layers: [layerOf(path.join(globals, 'v11'))],
     });
   });
 
@@ -378,7 +375,7 @@ describe('pnpm global layout', () => {
 
     // pnpm 正在切版本时，读到的目录下一瞬就没了：当作不存在，别把整次探测拖垮
     await expect(api.getLayout()).resolves.toMatchObject({
-      candidates: candidatesOf(path.join(globals, 'v11')),
+      layers: [layerOf(path.join(globals, 'v11'))],
     });
   });
 
@@ -386,17 +383,14 @@ describe('pnpm global layout', () => {
     mocks.execSync.mockReturnValue('');
     mocks.readdir.mockRejectedValue(new Error('EACCES'));
 
-    await expect(api.getLayout()).resolves.toEqual({
-      candidates: [],
-      depot: null,
-    });
+    await expect(api.getLayout()).resolves.toEqual({ layers: [] });
   });
 
   it('keeps the pnpm 10 root that pnpm itself reports', async () => {
     mocks.execSync.mockReturnValue('/global/10/node_modules\n');
 
     await expect(api.getLayout()).resolves.toMatchObject({
-      candidates: candidatesOf('/global/10/node_modules'),
+      layers: [layerOf('/global/10/node_modules')],
     });
   });
 
@@ -433,22 +427,36 @@ describe('pnpm global layout', () => {
     mocks.stat.mockReset();
     fakeFs(tree);
 
-    // 每装一次都可能多一张表，新到旧地排着，谁先谁后由 mtime 决定
-    await expect(api.getLayout()).resolves.toMatchObject({
-      depot: path.join(newer, '.pnpm', 'node_modules'),
-    });
+    // 每装一次都可能多一张表：各层各带各的表，新到旧地排着，谁先谁后由 mtime 决定。
+    // 不能全进程只挑一张——拿别的层的表去补这层的包，「缺哪些」永远算不对
+    const { layers } = await api.getLayout();
+
+    expect(layers).toEqual(
+      expect.arrayContaining([
+        { pkgDir: newer, depot: path.join(newer, '.pnpm', 'node_modules') },
+        { pkgDir: older, depot: path.join(older, '.pnpm', 'node_modules') },
+      ]),
+    );
+    // 新的排在前面
+    expect(layers.map(({ pkgDir }) => pkgDir).indexOf(newer)).toBeLessThan(
+      layers.map(({ pkgDir }) => pkgDir).indexOf(older),
+    );
   });
 
   it('skips a dependency table that exists but holds nothing', async () => {
     // pnpm 12 把依赖 public hoist 到全局安装根自己的 node_modules 顶层，
     // 同时留下一个空的 `.pnpm/node_modules`：只认「目录在不在」会挑中空壳
-    await withEnv({ PNPM_HOME: '/pnpm-home' }, async () => {
-      mocks.execSync.mockReturnValue('');
-      mocks.readdir.mockResolvedValue([]);
-      mocks.stat.mockResolvedValue(isDir);
+    const globals = path.join(getPnpmHome(), 'global');
 
-      // 根目录下全是空表：宁可没有，也别拿空壳去算「缺哪些依赖」
-      await expect(api.getLayout()).resolves.toMatchObject({ depot: null });
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) =>
+      dir === globals ? ['v11'] : [],
+    );
+    mocks.stat.mockResolvedValue(isDir);
+
+    // 全是空表：宁可没有，也别拿空壳去算「缺哪些依赖」
+    await expect(api.getLayout()).resolves.toEqual({
+      layers: [layerOf(path.join(globals, 'v11'))],
     });
   });
 
@@ -456,8 +464,7 @@ describe('pnpm global layout', () => {
     mocks.stat.mockRejectedValue(new Error('missing'));
 
     await expect(api.getLayout()).resolves.toEqual({
-      candidates: candidatesOf('/global/node_modules'),
-      depot: null,
+      layers: [layerOf('/global/node_modules')],
     });
   });
 });
