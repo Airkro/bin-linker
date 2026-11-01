@@ -22,15 +22,20 @@ patch:
         PNPM_HOME: /home/.share/pnpm
         PATH: /home/.share/pnpm/bin:/home/.share/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       stages:
-        # node:lts-alpine 只自带 corepack，没有 pnpm。
+        # node 官方镜像从 25 起已不再自带 corepack（实测 node:lts-alpine 里 corepack 为 not found），
+        # 这里从 npm 装一份到全局目录，再软链出 corepack/pnpm/pnpx。
         # 不用 `npm i -g pnpm`：npm 的全局 bin 落在 /usr/local/bin，
         # 而 pnpm 10 起要求 PNPM_HOME/bin 在 PATH 里才肯执行全局操作，
         # 两套目录容易对不上，统一用 corepack 按 packageManager 字段准备版本。
-        - name: 启用 pnpm
+        - name: 安装 corepack
           script: |
             mkdir -p "$PNPM_HOME/bin"
-            corepack enable --install-directory "$PNPM_HOME/bin"
-            pnpm -v # corepack 首次运行时会按 packageManager 自动准备版本
+            npm i -g corepack --prefix /home/.share/corepack
+            ln -sf /home/.share/corepack/lib/node_modules/corepack/dist/corepack.js "$PNPM_HOME/bin/corepack"
+            ln -sf /home/.share/corepack/lib/node_modules/corepack/dist/pnpm.js "$PNPM_HOME/bin/pnpm"
+            ln -sf /home/.share/corepack/lib/node_modules/corepack/dist/pnpx.js "$PNPM_HOME/bin/pnpx"
+        - name: 启用 pnpm
+          script: pnpm -v # 首次运行时会按 packageManager 自动准备 pnpm 版本
         - name: 预热 pnpm
           script: |
             pnpm config set store-dir /home/.share/pnpm/store --global
