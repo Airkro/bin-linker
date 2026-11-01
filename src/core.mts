@@ -4,7 +4,6 @@ import path from 'node:path';
 import {
   createSymlink,
   ensureDir,
-  getLinkType,
   isWindows,
   localBinDir,
   readPackageJson,
@@ -27,9 +26,9 @@ export type PkgResult = {
   noBin?: boolean;
   /** pnpm 的全局 bin 目录不在 PATH，定位不了包 */
   globalBinDir?: boolean;
-  errors?: Array<{ name: string; error: Error }>;
   /** 本次补上了包自己解析不到的依赖 */
   depsLinked?: boolean;
+  errors?: Array<{ name: string; error: Error }>;
 };
 
 type BinEntries = Array<[name: string, relPath: string]>;
@@ -43,7 +42,7 @@ function getBinEntries(pkg: string, bin: PackageMeta['bin']): BinEntries {
   return Object.entries(bin ?? {});
 }
 
-/** Windows 的 EPERM 要靠管理员权限解决，其它错误在本地处理掉 */
+/** Windows 的 EPERM 要靠管理员权限解决（交给 CLI 统一提示），其它错误在本地处理掉 */
 function rethrowPermissions(error: unknown): Error {
   if (isWindows && (error as NodeJS.ErrnoException).code === 'EPERM') {
     throw error;
@@ -58,7 +57,7 @@ async function readDirNames(dir: string): Promise<Set<string>> {
 }
 
 /**
- * 把包自己解析不到的依赖补进它的 `node_modules`。
+ * 把包自己解析不到的依赖补进它的 `node_modules`，返回是否真的补上了东西。
  *
  * pnpm 全局安装把真实包放在 store 里，依赖平铺在全局安装根的 `.pnpm/node_modules`。
  * node 按真实路径向上找依赖，从 store 那一层往上够不到全局安装根，包一 require
@@ -69,7 +68,7 @@ async function readDirNames(dir: string): Promise<Set<string>> {
  * 「缺哪些」只付一次 readdir：依赖表里列出来的就是这一版 pnpm 认为这个包该看得到的
  * 全部依赖，表里有、包里没有，就是缺。
  *
- * 返回是否真的补上了东西；补不上不算错误，命令链接已经建好，缺哪个依赖交给运行时照实报错。
+ * 补不上不算错误：命令链接已经建好，缺哪个依赖交给运行时照实报错。
  */
 export async function linkMissingDeps(pkgDir: string): Promise<boolean> {
   const depotDir = await resolveGlobalDepotDir();
@@ -80,32 +79,30 @@ export async function linkMissingDeps(pkgDir: string): Promise<boolean> {
 
   const realPkgDir = await fs.realpath(pkgDir).catch(() => pkgDir);
   const depsNodeModules = path.join(realPkgDir, 'node_modules');
-  const deps = await fs.readdir(depotDir).catch((): string[] => []);
+  const table = await fs.readdir(depotDir).catch((): string[] => []);
   const present = await readDirNames(depsNodeModules);
-  const todo = deps.filter((dep) => !present.has(dep));
+  const todo = table.filter((dep) => !present.has(dep));
 
   if (todo.length === 0) {
+    return false;
+  }
+
+  if (!(await ensureDir(depsNodeModules))) {
     return false;
   }
 
   let linked = false;
 
   for (const dep of todo) {
-    try {
-      if (!(await ensureDir(depsNodeModules))) {
-        return linked;
-      }
+    // 依赖目录也是 store 里的真实目录，Windows 上与包本体一样建目录链接
+    const done = await createSymlink(path.join(depsNodeModules, dep), [
+      path.join(depotDir, dep),
+    ]).then(
+      () => true,
+      () => false,
+    );
 
-      // 依赖目录也是 store 里的真实目录，Windows 上与包本体一样用 junction
-      await fs.symlink(
-        path.join(depotDir, dep),
-        path.join(depsNodeModules, dep),
-        getLinkType(),
-      );
-      linked = true;
-    } catch {
-      // 补不上就算了：链接本身已经建好，缺哪个依赖交给运行时照实报错。
-    }
+    linked ||= done;
   }
 
   return linked;
@@ -118,7 +115,9 @@ export async function linkMissingDeps(pkgDir: string): Promise<boolean> {
  * 读不到元数据就换下一个候选——早前是先挑第一个路径再去读，读不到直接报「找不到包」，
  * 明明后面还排着一份好的。
  */
-async function pickPackage(pkgDirs: string[]) {
+async function pickPackage(
+  pkgDirs: string[],
+): Promise<{ pkgDir: string; pkgJson: PackageMeta } | null> {
   for (const pkgDir of pkgDirs) {
     const pkgJson = await readPackageJson(pkgDir);
 
@@ -145,6 +144,8 @@ async function linkBinEntries(
       ]);
       commands.push(name);
     } catch (error) {
+      // Windows 的 EPERM 靠管理员权限解决，往上冒给 CLI 统一提示；
+      // 其它错误只赔上这一个命令，包与其余命令照常
       errors.push({ name, error: rethrowPermissions(error) });
     }
   }
@@ -199,14 +200,11 @@ async function linkPackageBin(input: string): Promise<PkgResult> {
 export async function linkPackageBins(
   packages: string[] = [],
 ): Promise<{ results: PkgResult[] }> {
-  if (packages.length === 0) {
-    return { results: [] };
-  }
-
   if (!(await ensureDir(localBinDir))) {
     throw new Error('无法创建目标目录');
   }
 
+  // 一个包出错只赔上它自己：别让某个包的意外把整次运行炸掉
   const results: PkgResult[] = [];
 
   for (const pkg of packages) {

@@ -27,18 +27,32 @@ const {
   ensureDir,
   getLinkType,
   isWindows,
+  linkPointsTo,
   localBinDir,
   readPackageJson,
 } = await import('../src/fs.mts');
 
-const LINK = '/link';
-const TARGET = '/target';
+const LINK = '/project/node_modules/.bin/tool';
+const TARGET = '/global/node_modules/tool/cli.js';
+
+/** 让 readlink 只对给定路径成功，其余一律当作不是链接 */
+function readingOnly(points: Record<string, string>) {
+  mocks.readlink.mockImplementation(async (link: string) => {
+    if (link in points) {
+      return points[link];
+    }
+
+    throw Object.assign(new Error('not a link'), { code: 'EINVAL' });
+  });
+}
 
 describe('filesystem helpers', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     // 默认：链接不存在（readlink 报 ENOENT），realpath 原样返回
-    mocks.readlink.mockRejectedValue({ code: 'ENOENT' });
+    mocks.readlink.mockRejectedValue(
+      Object.assign(new Error('missing'), { code: 'ENOENT' }),
+    );
     mocks.realpath.mockImplementation(async (target: string) => target);
     mocks.unlink.mockResolvedValue(undefined);
     mocks.symlink.mockResolvedValue(undefined);
@@ -51,6 +65,7 @@ describe('filesystem helpers', () => {
   });
 
   it('creates directories and reports creation failures', async () => {
+    mocks.mkdir.mockResolvedValue(undefined);
     await expect(ensureDir('/tmp/bin-linker')).resolves.toBe(true);
 
     mocks.mkdir.mockRejectedValueOnce(new Error('read-only'));
@@ -63,6 +78,7 @@ describe('filesystem helpers', () => {
       bin: { tool: 'cli.js' },
     });
 
+    // 内容不是 JSON：与「文件不存在」一样当作读不到
     mocks.readFile.mockResolvedValueOnce('invalid json');
     await expect(readPackageJson('/global/tool')).resolves.toBeNull();
 
@@ -71,7 +87,13 @@ describe('filesystem helpers', () => {
   });
 
   it('creates the link when nothing is there yet', async () => {
+    mocks.unlink.mockRejectedValue(
+      Object.assign(new Error('missing'), { code: 'ENOENT' }),
+    );
+
+    // 第一次链这个包时目标位置本来就没有东西，unlink 报 ENOENT 不算失败
     await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
+    expect(mocks.unlink).toHaveBeenCalledWith(LINK);
     expect(mocks.symlink).toHaveBeenCalledWith(
       TARGET,
       LINK,
@@ -83,7 +105,7 @@ describe('filesystem helpers', () => {
   it('leaves a link that already points at the target', async () => {
     // 命令链接在重跑、`pnpm <cmd>` 前置钩子里是常态，重建纯属两次多余的写操作
     // readlink 先拿字面路径去比（省一次 realpath）——这里让字面路径就对得上
-    mocks.readlink.mockResolvedValue(TARGET);
+    readingOnly({ [LINK]: TARGET });
 
     await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
     expect(mocks.unlink).not.toHaveBeenCalled();
@@ -91,20 +113,31 @@ describe('filesystem helpers', () => {
   });
 
   it('accepts any of the candidate targets', async () => {
-    // 包同时留在两个版本目录里，链接指着其中一份就算到位
-    mocks.readlink.mockResolvedValue('/global/10/tool');
+    // 包同时留在两个版本目录里，链接指着其中一份就算到位（第一份的软链可能是断的）
+    readingOnly({
+      '/project/node_modules/tool': '/global/10/node_modules/tool',
+    });
+    mocks.realpath.mockImplementation(async (dir: string) =>
+      dir.startsWith('/global/v11') ? dir : '/real/tool',
+    );
 
     await expect(
-      createSymlink(LINK, ['/global/11/tool', '/global/10/tool']),
+      linkPointsTo('/project/node_modules/tool', [
+        '/global/v11/node_modules/tool',
+        '/global/10/node_modules/tool',
+      ]),
     ).resolves.toBe(true);
     expect(mocks.symlink).not.toHaveBeenCalled();
   });
 
   it('rebuilds a link that points somewhere else', async () => {
-    mocks.readlink.mockResolvedValue('/real/stale/tool');
-    mocks.realpath.mockImplementation(async (target: string) =>
-      target === TARGET ? '/real/keyed/tool' : target,
+    // 指向旧版本装的那一份：链接与目标解析出来是两处
+    readingOnly({ [LINK]: '/global/old/tool' });
+    mocks.realpath.mockImplementation(async (dir: string) =>
+      dir === LINK ? '/real/store/old/tool' : '/real/store/tool',
     );
+
+    await expect(linkPointsTo(LINK, [TARGET])).resolves.toBe(false);
 
     await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
     expect(mocks.unlink).toHaveBeenCalledWith(LINK);
@@ -115,39 +148,31 @@ describe('filesystem helpers', () => {
     );
   });
 
-  it('rebuilds a dangling link even when both paths fail to resolve', async () => {
-    // 链接在，指向的地方已经没了：两边 realpath 都失败，退回字面路径正好对得上
+  it('rebuilds a dangling link whose target is gone too', async () => {
+    // 链接本身解析不到：它是坏的，重建。两边 realpath 都失败时退回字面路径正好对得上
     // ——早前就是这么把空壳判成「已到位」，于是永远不重建
     const gone = vi.fn(async () => {
       throw new Error('gone');
     });
 
-    mocks.readlink.mockResolvedValue('/global/old/tool');
+    readingOnly({ [LINK]: '/global/old/tool' });
     mocks.realpath.mockImplementation(gone);
 
+    await expect(linkPointsTo(LINK, [TARGET])).resolves.toBe(false);
     await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
     expect(gone).toHaveBeenCalled();
     expect(mocks.symlink).toHaveBeenCalled();
   });
 
-  it('rebuilds when the link cannot be resolved at all', async () => {
-    mocks.readlink.mockResolvedValue('/global/old/tool');
-
-    await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
-    expect(mocks.symlink).toHaveBeenCalled();
-  });
-
-  it('rebuilds when the entry is a plain directory', async () => {
+  it('rebuilds when the project entry is a plain directory', async () => {
     // node_modules/<pkg> 被解压/拷进来一份真实目录时 readlink 会 EINVAL，同样要重建
-    mocks.readlink.mockRejectedValue({ code: 'EINVAL' });
+    mocks.readlink.mockRejectedValue(
+      Object.assign(new Error('not a link'), { code: 'EINVAL' }),
+    );
 
-    await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
-    expect(mocks.symlink).toHaveBeenCalled();
-  });
-
-  it('tolerates a missing previous link', async () => {
-    mocks.unlink.mockRejectedValueOnce({ code: 'ENOENT' });
-
+    await expect(
+      linkPointsTo('/project/node_modules/tool', [TARGET]),
+    ).resolves.toBe(false);
     await expect(createSymlink(LINK, [TARGET])).resolves.toBe(true);
     expect(mocks.symlink).toHaveBeenCalled();
   });

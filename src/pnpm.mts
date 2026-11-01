@@ -76,54 +76,53 @@ function withEnv<T>(vars: Record<string, string | undefined>, run: () => T): T {
 }
 
 /**
- * `pnpm root -g` 的全局根目录，查询失败（pnpm 不在 PATH 或校验不通过）时返回 null，
+ * `pnpm root -g` 给出的全局根目录；查询失败（pnpm 不在 PATH 或校验不通过）时返回 null，
  * 由调用方回退到遍历 `<pnpmHome>/global` 自行查找。
  */
 function queryPnpmGlobalPath(): string | null {
   const { PATH: originalPath, PNPM_HOME: pnpmHome } = process.env;
   // pnpm 10/11 都会校验全局 bin 目录是否在 PATH，否则连 `root -g` 也报错
-  const env = {
-    PATH: [
-      ...new Set([
-        ...([
-          pnpmHome,
-          pnpmHome && path.join(pnpmHome, 'bin'),
-          path.join(getPnpmHome(), 'bin'),
-        ].filter(Boolean) as string[]),
-        ...(originalPath ? originalPath.split(path.delimiter) : []),
-      ]),
-    ].join(path.delimiter),
-    // pnpm 传给子进程的值，会盖掉这里补进 PATH 的目录，让校验直接失败
-    npm_config_global_bin_dir: undefined,
-    // corepack 在 CI 置位时才不交互式问「是否下载」
-    CI: 'true',
-    // 更新检查是背景网络请求，断网时能把一次查询拖成分钟级
-    npm_config_update_notifier: 'false',
-  };
+  const pathEntries = [
+    pnpmHome,
+    pnpmHome && path.join(pnpmHome, 'bin'),
+    path.join(getPnpmHome(), 'bin'),
+    ...(originalPath ?? '').split(path.delimiter),
+  ].filter(Boolean);
 
-  return withEnv(env, () => {
-    try {
-      // pnpm 11 起会按附近的 packageManager 声明重启成另一个版本（甚至现下），
-      // 查全局目录用不着版本切换，显式关掉。
-      // stdin 显式给空：不给的话子进程继承调用方那条管道，
-      // `sleep 30 | bin-linker` 这类调用里它会一直等着一个永远不结束的 stdin。
-      const output = execSync(
-        'pnpm --config.manage-package-manager-versions=false root -g',
-        {
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'pipe'],
-        },
-      );
-      const paths = output
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => path.isAbsolute(line));
+  return withEnv(
+    {
+      PATH: [...new Set(pathEntries)].join(path.delimiter),
+      // pnpm 传给子进程的值，会盖掉这里补进 PATH 的目录，让校验直接失败
+      npm_config_global_bin_dir: undefined,
+      // corepack 在 CI 置位时才不交互式问「是否下载」
+      CI: 'true',
+      // 更新检查是背景网络请求，断网时能把一次查询拖成分钟级
+      npm_config_update_notifier: 'false',
+    },
+    () => {
+      try {
+        // pnpm 11 起会按附近的 packageManager 声明重启成另一个版本（甚至现下），
+        // 查全局目录用不着版本切换，显式关掉。
+        // stdin 显式给空：不给的话子进程继承调用方那条管道，
+        // `sleep 30 | bin-linker` 这类调用里它会一直等着一个永远不结束的 stdin。
+        const output = execSync(
+          'pnpm --config.manage-package-manager-versions=false root -g',
+          {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        );
+        const paths = output
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => path.isAbsolute(line));
 
-      return paths.at(-1) ?? output.trim();
-    } catch {
-      return null;
-    }
-  });
+        return paths.at(-1) ?? output.trim();
+      } catch {
+        return null;
+      }
+    },
+  );
 }
 
 let globalPathCache: { value: string | null } | undefined;
@@ -149,13 +148,12 @@ export function isPnpmBinDirMissingFromPath(): boolean {
   const { PATH: pathEnv, npm_config_global_bin_dir: globalBinDir } =
     process.env;
   const configuredBinDir = globalBinDir || getPnpmHome();
+  const entries = (pathEnv ?? '')
+    .split(path.delimiter)
+    .map((entry) => path.resolve(entry || '.'));
 
   return [configuredBinDir, path.join(configuredBinDir, 'bin')].every(
-    (dir) =>
-      !(pathEnv ?? '')
-        .split(path.delimiter)
-        .map((entry) => path.resolve(entry || '.'))
-        .includes(path.resolve(dir)),
+    (dir) => !entries.includes(path.resolve(dir)),
   );
 }
 
@@ -164,9 +162,12 @@ export function isPnpmBinDirMissingFromPath(): boolean {
  * 一次全局安装会新建一个版本目录（pnpm 11 下还多一个内容寻址的哈希目录），
  * 旧的仍在；最近改动的那个最可能装着要找的东西。
  */
-async function mtimeOrderedDirs(parent: string, names: string[]) {
+async function mtimeOrderedDirs(
+  parent: string,
+  entries: string[],
+): Promise<string[]> {
   const dirs = await Promise.all(
-    names.map(async (name) => {
+    entries.map(async (name) => {
       const dir = path.join(parent, name);
 
       return {
@@ -186,73 +187,47 @@ async function mtimeOrderedDirs(parent: string, names: string[]) {
 }
 
 /**
- * 全局安装的两种布局，扫一遍盘就都拿到，且只扫一遍。
+ * 一个版本目录下所有装出来的布局根：先它自己，再它的子目录（pnpm 11 的内容寻址目录等）。
  *
- * - `layers`：装着包本体与依赖表的那些 `node_modules` 层，按优先级排好。
- * - `depots`：其中真的存在 `.pnpm/node_modules`（「这次安装看得见的全部包」那张平铺表）的层。
- *
- * 目录名跟 pnpm 版本号没有约定（pnpm 10 用 `10`，pnpm 11 换成 `v11`，每装一次再套一层
- * 内容寻址的哈希目录），所以不猜版本号，直接读盘 + 按 mtime 从新到旧。
- * 早前 `buildLayoutRoots`、`findGlobalDepotDir`、`resolveInRoot` 各扫一遍同一份目录，
- * 现在统一走这里。
+ * 这两层是「包那层 `node_modules` 可能落在哪」的全部来源，
+ * 包定位与依赖表探测都从这里出发，不必各写一遍。
  */
-const layoutCache: {
-  value?: Promise<{ layers: string[]; depots: string[] }>;
-} = {};
-
-function scanVersionDir(versionDir: string) {
-  // `pnpm root -g` 有时直接给到 `<版本目录>/node_modules` 那一层，别再往下套一层
-  const layers = [
-    path.basename(versionDir) === 'node_modules'
-      ? versionDir
-      : path.join(versionDir, 'node_modules'),
+async function layoutRootsIn(versionDir: string): Promise<string[]> {
+  return [
+    versionDir,
+    ...(await mtimeOrderedDirs(versionDir, await readDir(versionDir))),
   ];
-
-  return readDir(versionDir).then(async (names) => {
-    const subDirs =
-      names.includes('node_modules') || names.length === 0
-        ? []
-        : await mtimeOrderedDirs(versionDir, names);
-
-    for (const subDir of subDirs) {
-      layers.push(path.join(subDir, 'node_modules'));
-    }
-
-    return layers;
-  });
 }
 
-export function getLayout(): Promise<{ layers: string[]; depots: string[] }> {
-  layoutCache.value ??= (async () => {
-    const detected = getPnpmGlobalPath();
-    const versionDirs = [
-      ...new Set([
-        ...(detected ? [detected] : []),
-        ...(await mtimeOrderedDirs(
-          pnpmGlobalRoot,
-          await readDir(pnpmGlobalRoot),
-        )),
-      ]),
-    ];
-    const scanned = await Promise.all(
-      versionDirs.map((dir) => scanVersionDir(dir)),
-    );
-    const layers = [...new Set(scanned.flat())];
-    const present = await Promise.all(
-      layers.map((layer) =>
-        isDirectory(path.join(layer, '.pnpm', 'node_modules')),
-      ),
-    );
+let layoutsCache: { value: Promise<string[]> } | undefined;
 
-    return {
-      layers,
-      depots: layers
-        .filter((_, index) => present[index])
-        .map((layer) => path.join(layer, '.pnpm', 'node_modules')),
-    };
-  })();
+/**
+ * 全部布局根，顺序即优先级：`pnpm root -g` 给出的排最前，其余版本目录按 mtime 从新到旧。
+ *
+ * 早前这里写死过 `v11`、`10` … `5` 一串版本号去猜，可目录名跟版本号并没有约定
+ * （pnpm 10 用 `10`，pnpm 11 换成了 `v11`），下一个谁知道。直接读盘比猜准，
+ * 也不会在 pnpm 升级后整段失效。
+ */
+export function getLayoutRoots(): Promise<string[]> {
+  layoutsCache ??= {
+    value: (async () => {
+      const detected = getPnpmGlobalPath();
+      const versionDirs = await mtimeOrderedDirs(
+        pnpmGlobalRoot,
+        await readDir(pnpmGlobalRoot),
+      );
+      const versions = await Promise.all(
+        versionDirs.map((dir) => layoutRootsIn(dir)),
+      );
 
-  return layoutCache.value;
+      // 查询结果常就是某个版本目录，留两份等于把同一份布局探两遍
+      return [
+        ...new Set([...(detected ? [detected] : []), ...versions.flat()]),
+      ];
+    })(),
+  };
+
+  return layoutsCache.value;
 }
 
 /**
@@ -272,7 +247,35 @@ export function toPkgName(input: string): string {
 }
 
 /**
- * 解析全局包可能的安装位置，顺序即优先级（层按新到旧）。
+ * 在一个布局根里找包，只在两处固定位置看，不扫目录：
+ * `node_modules/<pkg>`（直接依赖）与 `node_modules/.pnpm/node_modules/<pkg>`
+ * （虚拟布局平铺的「这次安装看得见的全部包」，间接依赖常常只在这里出现）。
+ *
+ * 真实包在 store 里时这两处都是指向它的软链，`stat` 会跟过去，
+ * 所以「能不能 stat 到一个目录」就是「这个位置有没有这个包」。
+ */
+async function resolveInRoot(
+  root: string,
+  pkg: string,
+): Promise<string | null> {
+  // `pnpm root -g` 给的常是 `<版本目录>/node_modules`，那种写法这里也兜住
+  const base =
+    path.basename(root) === 'node_modules' ? path.dirname(root) : root;
+  const candidates = [
+    path.join(base, 'node_modules', pkg),
+    path.join(base, 'node_modules', '.pnpm', 'node_modules', pkg),
+  ];
+  for (const candidate of candidates) {
+    if (await isDirectory(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * 解析全局包可能的安装位置，顺序即优先级（布局根按新到旧）。
  *
  * 返回**全部**候选而不是第一个：同一个包可能同时留在好几个版本目录里，
  * 其中一份的软链可能已经断了。挑哪一份要读了元数据才知道，交给调用方。
@@ -281,22 +284,43 @@ export function toPkgName(input: string): string {
  */
 export async function resolveGlobalPkgDirs(name: string): Promise<string[]> {
   const pkg = toPkgName(name);
-  const { layers } = await getLayout();
-  const found = await Promise.all(
-    layers.flatMap((layer) =>
-      [pkg, path.join('.pnpm', 'node_modules', pkg)].map((position) => {
-        const dir = path.join(layer, position);
+  const roots = await getLayoutRoots();
+  const found = [];
 
-        return isDirectory(dir).then((ok) => (ok ? dir : null));
-      }),
-    ),
-  );
+  for (const root of roots) {
+    found.push(await resolveInRoot(root, pkg));
+  }
 
-  // 同一个真实目录可能被好几层认出来，去重且保持「新到旧」的顺序
+  // 同一个真实目录可能被好几个根认出来，去重且保持「新到旧」的顺序
   return [...new Set(found.filter(Boolean))] as string[];
 }
 
-/** 存放「全部已装包」的那一层（`.pnpm/node_modules`），包够不到自己的间接依赖就靠它补 */
+let depotDirCache: { value: Promise<string | null> } | undefined;
+
+/**
+ * 解析 pnpm 全局安装根里存放「全部已装包」的那一层（`.pnpm/node_modules`）。
+ *
+ * 真实包在 store 里，包本身够不到这一层，那里平铺着全部依赖。
+ * 候选顺序与包定位共用同一份布局根，pnpm 11 的内容寻址目录也一并覆盖。
+ * 答案与包无关，每个包都问一遍纯属浪费，记一次就够。
+ */
 export function resolveGlobalDepotDir(): Promise<string | null> {
-  return getLayout().then(({ depots }) => depots[0] ?? null);
+  depotDirCache ??= {
+    value: (async () => {
+      const roots = await getLayoutRoots();
+      const candidates = roots.map((root) =>
+        path.join(root, 'node_modules', '.pnpm', 'node_modules'),
+      );
+
+      for (const candidate of candidates) {
+        if (await isDirectory(candidate)) {
+          return candidate;
+        }
+      }
+
+      return null;
+    })(),
+  };
+
+  return depotDirCache.value;
 }

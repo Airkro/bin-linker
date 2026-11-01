@@ -60,7 +60,7 @@ async function resolveTargets(targets: string[]): Promise<string[]> {
  * 确认它没断：两边都解析不到就退回字面路径去比，一个指向同一路径的空壳会正好对得上，
  * 于是永远不重建。所以链接那一侧解析失败时一律判否。
  */
-async function linkPointsTo(link: string, targets: string[]): Promise<boolean> {
+export async function linkPointsTo(link: string, targets: string[]): Promise<boolean> {
   const current = await fs.readlink(link).catch(() => null);
 
   // 不存在、或压根不是链接（普通目录会 EINVAL）：都算「要重建」

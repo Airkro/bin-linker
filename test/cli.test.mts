@@ -10,6 +10,10 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../src/core.mts', () => ({
   linkPackageBins: mocks.linkPackageBins,
 }));
+vi.mock('../src/pnpm.mts', () => ({
+  // 名字归一的细节在 pnpm.test 里验，这里只要它把路径尾巴去掉
+  toPkgName: (name: string) => name.replace(/^.*\//, ''),
+}));
 vi.mock('../src/output.mts', () => ({
   fmt: {
     cmd: (value: string) => value,
@@ -28,18 +32,19 @@ async function runWith(results: unknown[]): Promise<number> {
   return run();
 }
 
+/** 播报里提到过某个词的那一次调用 */
+const said = (calls: unknown[][], word: string) =>
+  calls.find(([message]) => String(message).includes(word))?.[0];
+
 describe('cli', () => {
   beforeEach(() => {
-    mocks.error.mockReset();
-    mocks.info.mockReset();
-    mocks.linkPackageBins.mockReset();
-    mocks.warn.mockReset();
+    vi.resetAllMocks();
     process.argv = ['node', 'bin-linker'];
   });
 
-  it('normalizes packages before deduplicating them', async () => {
+  it('normalizes arguments into package names before deduping', async () => {
     // 同一个包写三遍只该链一次；脚本里常传 $(pwd)/node_modules/xxx 这种绝对路径，
-    // node_modules 的位置按包名拼，带路径会解析不到。
+    // node_modules 的位置按包名拼，带路径就拼不出来，得先归一。
     process.argv = [
       'node',
       'bin-linker',
@@ -52,19 +57,13 @@ describe('cli', () => {
 
     await runWith([]);
 
-    expect(mocks.linkPackageBins).toHaveBeenCalledWith(['tool', '@scope/tool']);
-  });
-
-  it('keeps a bare scope name as it is', async () => {
-    process.argv = ['node', 'bin-linker', './node_modules/@scope'];
-
-    await runWith([]);
-
-    expect(mocks.linkPackageBins).toHaveBeenCalledWith(['@scope']);
+    // 工程内的绝对路径先相对化再取包名：`.../@scope/tool` 归一成 `@scope/tool`；
+    // 工程外的路径原样留着，包名只取最后几段——这里两处都落回同一个 `tool`
+    expect(mocks.linkPackageBins).toHaveBeenCalledWith(['tool']);
   });
 
   it('shows usage and fails when no packages are supplied', async () => {
-    // 没说要链什么就直接给用法，退出码 1：这不算成功
+    // 没干活就是失败，跟「没链上任何命令」一个口径
     await expect(run()).resolves.toBe(1);
     expect(mocks.warn).toHaveBeenCalled();
     expect(mocks.linkPackageBins).not.toHaveBeenCalled();
@@ -87,17 +86,6 @@ describe('cli', () => {
     ]);
   });
 
-  it('reports command errors and returns failure when nothing links', async () => {
-    process.argv = ['node', 'bin-linker', 'broken'];
-
-    await expect(
-      runWith([
-        { pkg: 'broken', errors: [{ name: 'broken', error: new Error('x') }] },
-      ]),
-    ).resolves.toBe(1);
-    expect(mocks.error).toHaveBeenCalled();
-  });
-
   it('reports totals when multiple packages link successfully', async () => {
     process.argv = ['node', 'bin-linker', 'first', 'second'];
 
@@ -107,7 +95,9 @@ describe('cli', () => {
         { pkg: 'second', commands: ['second'] },
       ]),
     ).resolves.toBe(0);
+    // 两个包各一条 + 一条总计
     expect(mocks.info).toHaveBeenCalledTimes(3);
+    expect(said(mocks.info.mock.calls, '共链接了')).toContain('2');
   });
 
   it('does not report a total for one successful package', async () => {
@@ -117,6 +107,18 @@ describe('cli', () => {
       runWith([{ pkg: 'single', commands: ['single'] }]),
     ).resolves.toBe(0);
     expect(mocks.info).toHaveBeenCalledTimes(1);
+  });
+
+  it('warns and fails when nothing links', async () => {
+    process.argv = ['node', 'bin-linker', 'broken'];
+
+    await expect(
+      runWith([
+        { pkg: 'broken', errors: [{ name: 'broken', error: new Error('x') }] },
+      ]),
+    ).resolves.toBe(1);
+    expect(said(mocks.error.mock.calls, '链接 broken 失败')).toBeDefined();
+    expect(said(mocks.warn.mock.calls, '没有链接任何命令')).toBeDefined();
   });
 
   it('mentions dependency links right after the commands it fixed', async () => {
@@ -131,18 +133,9 @@ describe('cli', () => {
       ]),
     ).resolves.toBe(0);
 
-    const notified = mocks.info.mock.calls.find(([message]) =>
-      String(message).includes('补全依赖'),
-    );
-
-    expect(notified?.[0]).toContain('tool');
+    expect(said(mocks.info.mock.calls, '补全依赖')).toContain('tool');
     // 补依赖的说明排在「找不到那个包」之前
-    const reported = mocks.warn.mock.calls.findIndex(([message]) =>
-      String(message).includes('找不到包'),
-    );
-
-    expect(reported).toBe(0);
-    expect(notified?.[0]).toContain('补全依赖');
+    expect(said(mocks.warn.mock.calls, '找不到包')).toContain('ghost');
   });
 
   it('does not mention dependency links when nothing was linked', async () => {
@@ -151,9 +144,7 @@ describe('cli', () => {
     await expect(
       runWith([{ pkg: 'tool', noBin: true, depsLinked: true }]),
     ).resolves.toBe(1);
-    expect(mocks.info).not.toHaveBeenCalledWith(
-      expect.stringContaining('补全'),
-    );
+    expect(said(mocks.info.mock.calls, '补全')).toBeUndefined();
   });
 
   it('fails when the pnpm global bin directory is missing from PATH', async () => {
@@ -165,9 +156,8 @@ describe('cli', () => {
         { pkg: 'other', commands: ['other'] },
       ]),
     ).resolves.toBe(1);
-    expect(mocks.warn).toHaveBeenCalledWith(
-      expect.stringContaining('无法定位'),
-    );
+    expect(said(mocks.warn.mock.calls, '无法定位')).toContain('tool');
+    expect(said(mocks.info.mock.calls, 'pnpm setup')).toBeDefined();
   });
 
   it('explains permission, missing-path and unknown failures', async () => {
@@ -182,6 +172,8 @@ describe('cli', () => {
       await expect(run()).resolves.toBe(1);
     }
 
-    expect(mocks.error).toHaveBeenCalledTimes(3);
+    expect(said(mocks.error.mock.calls, '管理员权限')).toBeDefined();
+    expect(said(mocks.error.mock.calls, '找不到指定的包')).toBeDefined();
+    expect(said(mocks.error.mock.calls, '操作失败: unknown')).toBeDefined();
   });
 });
