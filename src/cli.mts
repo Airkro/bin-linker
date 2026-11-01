@@ -75,13 +75,14 @@ function showResults({
         )}`,
       );
 
+      linkedCount += commands.length;
+
       if (pkgResult.depsLinked) {
         // pnpm 全局布局下包够不到自己的间接依赖，这里顺手补齐了，说明一下免得让人以为谁改动了 store
         log.info(
           `已为 ${fmt.pkg(pkgResult.pkg)} 补全依赖链接（来自 pnpm 全局安装根）`,
         );
       }
-      linkedCount += commands.length;
     }
 
     pkgResult.errors?.forEach(({ name, error }) => {

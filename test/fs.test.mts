@@ -32,8 +32,10 @@ vi.mock('node:fs', () => ({
 const {
   createSymlink,
   ensureDir,
+  getPnpmGlobalPath,
   getPnpmHome,
   getSymlinkType,
+  isPnpmBinDirMissingFromPath,
   isWindows,
   pnpmGlobalRoot,
   readPackageJson,
@@ -155,30 +157,16 @@ describe('filesystem helpers', () => {
     // @ts-expect-error Vitest supports query strings for isolated module imports.
     const ciFs = await import('../src/fs.mts?ci-pnpm10-node-modules');
 
-    // isDirectory 调用顺序：
-    // 1. 当前根 global/v11/tool 直接布局未命中
-    // 2. 当前根 global/v11/node_modules/tool 未命中
-    // 3~16. 推断候选根目录 global/10、9、8、7、6 的两种布局均未命中
-    // 17. 候选根目录 global/5 的直接布局（global/5/tool）未命中
-    // 18. 候选根目录 global/5 的 node_modules 子目录（global/5/node_modules/tool）命中
-    mocks.stat.mockRejectedValue(new Error('missing'));
-    mocks.stat
-      .mockRejectedValueOnce(new Error('not at root'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not at 10'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not at 9'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not at 8'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not at 7'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not at 6'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not in version root'))
-      .mockResolvedValueOnce(isDir);
-    // readdir 调用顺序：读当前根 global/v11 的虚拟目录（无结果）等各候选根目录
-    mocks.readdir.mockResolvedValue([]);
+    // 候选根目录按顺序探测，逐个尝试三种布局。只让 pnpm 10 的
+    // `<root>/node_modules/<pkg>` 这一种命中，其余一律落空。
+    // 这样断言不再依赖「第几次 stat 命中」这种跟实现顺序绑死的约定。
+    mocks.stat.mockImplementation(async (dir: string) => {
+      if (dir === path.join(globalRoot, '5', 'node_modules', 'tool')) {
+        return isDir;
+      }
+
+      throw new Error('missing');
+    });
 
     await expect(ciFs.resolveGlobalPkgDir('tool')).resolves.toBe(
       path.join(globalRoot, '5', 'node_modules', 'tool'),
@@ -230,6 +218,30 @@ describe('filesystem helpers', () => {
     );
   });
 
+  it('ignores version dirs that are already covered by the fixed candidates', async () => {
+    // 固定候选里已经包含 global/v11，扫到的同名目录不该再查一遍
+    const versionDir = path.join(pnpmGlobalRoot, 'v11');
+    const searched: string[] = [];
+
+    mocks.readdir.mockImplementation(async (dir: string) =>
+      dir === pnpmGlobalRoot ? ['v11'] : [],
+    );
+    mocks.stat.mockImplementation(async (dir: string) => {
+      searched.push(dir);
+
+      if (dir === versionDir) {
+        return { isDirectory: () => true, mtimeMs: 1 };
+      }
+
+      throw new Error('missing');
+    });
+
+    await expect(resolveGlobalPkgDir('tool')).resolves.toBeNull();
+    // 只作为「当前根目录 / 推断候选」查过，扫目录那一步没有重复查它
+    expect(searched.filter((dir) => dir === versionDir)).toHaveLength(1);
+    expect(searched).toContain(path.join(versionDir, 'tool'));
+  });
+
   it('returns null when no version dir exposes a dependency table', async () => {
     mocks.readdir.mockResolvedValue([]);
     mocks.stat.mockRejectedValue(new Error('missing'));
@@ -266,33 +278,127 @@ describe('filesystem helpers', () => {
     // 当前 pnpm（pnpm 11）的全局根目录中找不到包，但包由其它 pnpm 版本
     // （pnpm 10，位于 <pnpmHome>/global/5）安装。应跨版本目录继续查找。
     const globalRoot = pnpmGlobalRoot;
-    // isDirectory 调用顺序：
-    // 1. 当前全局根目录的直接布局（/global/node_modules/tool）未命中
-    // 2. 当前全局根目录的 node_modules 子目录布局未命中
-    // 当前全局根目录与推断候选根目录 global/v11 … global/6 均未命中，
-    // 最后候选根目录 global/5 的直接布局（global/5/tool）命中
-    mocks.stat.mockRejectedValue(new Error('missing'));
-    mocks.stat
-      .mockRejectedValueOnce(new Error('not at root'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not at v11'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not at 10'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not at 9'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not at 8'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not at 7'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockRejectedValueOnce(new Error('not at 6'))
-      .mockRejectedValueOnce(new Error('no node_modules subdir'))
-      .mockResolvedValueOnce(isDir);
-    mocks.readdir.mockResolvedValue([]);
+    const expected = path.join(globalRoot, '5', 'tool');
 
-    await expect(resolveGlobalPkgDir('tool')).resolves.toBe(
-      path.join(globalRoot, '5', 'tool'),
+    mocks.stat.mockImplementation(async (dir: string) => {
+      if (dir === expected) {
+        return isDir;
+      }
+
+      throw new Error('missing');
+    });
+
+    await expect(resolveGlobalPkgDir('tool')).resolves.toBe(expected);
+  });
+
+  it('searches version dirs newest first and tolerates unreadable ones', async () => {
+    // 一次全局安装会新建一个版本目录，旧的仍在。按 mtime 从新到旧查，
+    // 最近装的那个最可能装着要找的包；stat 失败（目录被删 / 无权限）的排到最后。
+    const versionDir = (name: string) => path.join(pnpmGlobalRoot, name);
+    // 只让最旧的那个版本目录命中，才看得出查找顺序
+    const expected = path.join(versionDir('alpha'), 'node_modules', 'tool');
+
+    mocks.readdir.mockImplementation(async (dir: string) =>
+      dir === pnpmGlobalRoot ? ['zeta', 'alpha', 'broken'] : [],
     );
+    mocks.stat.mockImplementation(async (dir: string) => {
+      if (dir === expected) {
+        return isDir;
+      }
+
+      if (dir === versionDir('zeta')) {
+        return { isDirectory: () => true, mtimeMs: 300 };
+      }
+
+      if (dir === versionDir('alpha')) {
+        return { isDirectory: () => true, mtimeMs: 200 };
+      }
+
+      throw new Error('vanished');
+    });
+
+    await expect(resolveGlobalPkgDir('tool')).resolves.toBe(expected);
+
+    const searched = mocks.stat.mock.calls.map(([dir]) => String(dir));
+    const firstSeen = (name: string) =>
+      searched.findIndex((dir) => dir.startsWith(versionDir(name)));
+
+    // 最近改动的先查；读不到 mtime 的排最后
+    expect(firstSeen('zeta')).toBeLessThan(firstSeen('alpha'));
+    expect(firstSeen('alpha')).toBeLessThan(firstSeen('broken'));
+  });
+
+  it('detects whether the pnpm bin directory is missing from PATH', async () => {
+    const originalPath = process.env.PATH;
+    const originalPnpmHome = process.env.PNPM_HOME;
+    const originalGlobalBinDir = process.env.npm_config_global_bin_dir;
+
+    try {
+      delete process.env.npm_config_global_bin_dir;
+      process.env.PNPM_HOME = '/pnpm-home';
+
+      process.env.PATH = ['/usr/bin', '/pnpm-home/bin'].join(path.delimiter);
+      expect(isPnpmBinDirMissingFromPath()).toBe(false);
+
+      // PNPM_HOME 本身也在 pnpm 的校验范围内（pnpm 10 看它，pnpm 11 看它的 bin）
+      process.env.PATH = '/pnpm-home';
+      expect(isPnpmBinDirMissingFromPath()).toBe(false);
+
+      process.env.PATH = '/usr/bin';
+      expect(isPnpmBinDirMissingFromPath()).toBe(true);
+
+      // pnpm 自己传给子进程的 npm_config_global_bin_dir 优先于 PNPM_HOME
+      process.env.npm_config_global_bin_dir = '/elsewhere/bin';
+      process.env.PATH = '/elsewhere/bin';
+      expect(isPnpmBinDirMissingFromPath()).toBe(false);
+
+      // 没有 PATH 时按空串处理，不该抛异常
+      delete process.env.PATH;
+      expect(isPnpmBinDirMissingFromPath()).toBe(true);
+    } finally {
+      if (originalPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = originalPath;
+      }
+      if (originalPnpmHome === undefined) {
+        delete process.env.PNPM_HOME;
+      } else {
+        process.env.PNPM_HOME = originalPnpmHome;
+      }
+      if (originalGlobalBinDir === undefined) {
+        delete process.env.npm_config_global_bin_dir;
+      } else {
+        process.env.npm_config_global_bin_dir = originalGlobalBinDir;
+      }
+    }
+  });
+
+  it('restores an unset PATH after querying the global root', async () => {
+    const originalPath = process.env.PATH;
+    const originalPnpmHome = process.env.PNPM_HOME;
+
+    try {
+      delete process.env.PATH;
+      process.env.PNPM_HOME = '/pnpm-home';
+      mocks.execSync.mockReturnValue('');
+
+      // 没有 PATH 时补出来的 PATH 也要能还原成「没有」
+      expect(getPnpmGlobalPath()).toBe('');
+      expect(process.env.PATH).toBeUndefined();
+    } finally {
+      if (originalPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = originalPath;
+      }
+      if (originalPnpmHome === undefined) {
+        delete process.env.PNPM_HOME;
+      } else {
+        process.env.PNPM_HOME = originalPnpmHome;
+      }
+      mocks.execSync.mockReturnValue('/global/node_modules\n');
+    }
   });
 
   it('creates symlinks and handles target and unlink errors', async () => {

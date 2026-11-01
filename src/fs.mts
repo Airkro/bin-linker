@@ -44,13 +44,24 @@ export function getPnpmHome(platform = process.platform): string {
 export const pnpmGlobalRoot = path.join(getPnpmHome(), 'global');
 
 /**
+ * 读目录内容，读不到时当作空目录。
+ *
+ * 「目录不存在」与「没有权限读」在查找路径里都是同一个意思：这里没有可用的候选。
+ */
+async function readDirEntries(dir: string): Promise<string[]> {
+  try {
+    return await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * pnpm 全局根目录下的版本目录（如 `9`、`v11`）。
  * 一次全局安装会新建一个，旧的仍在，所以这里按 mtime 从新到旧排。
  */
 async function getPnpmGlobalVersionDirs(): Promise<string[]> {
-  const entries = (await fs
-    .readdir(pnpmGlobalRoot)
-    .catch(() => [])) as string[];
+  const entries = await readDirEntries(pnpmGlobalRoot);
   const dirs = await Promise.all(
     entries.map(async (name) => {
       const dir = path.join(pnpmGlobalRoot, name);
@@ -74,13 +85,32 @@ async function getPnpmGlobalVersionDirs(): Promise<string[]> {
  * 父进程留着 stdin 不关时，子进程就一直等下去——CI 里就是这么挂满 10 分钟后
  * 被当成「无输出」掐掉的（构建 cnb-951-1k6b80tj6）。查询不需要输入，给个空 stdin。
  */
-const execOptions = { encoding: 'utf8', stdio: 'pipe' } as const;
+const execOptions = {
+  encoding: 'utf8',
+  // stdin 给空管道：查询不需要输入，也绝不能等调用方的 stdin
+  stdio: 'pipe',
+} as const;
 
 /**
  * corepack 在 `CI` 置位时不会交互式问「是否下载」，而是直接去下载。
  * 显式把 `CI` 交给它，别让它的行为取决于 runner 有没有设置这个变量。
  */
 const CI_ENV = 'CI';
+
+/**
+ * 把环境变量还原成调用前的样子：原本没有就删掉，有就放回去。
+ */
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    // 删除环境变量只能用动态键，这里变量名是调用方写死的常量或固定字面量
+    // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+    delete process.env[name];
+
+    return;
+  }
+
+  process.env[name] = value;
+}
 
 /**
  * 查询版本、`npm_config_*` 这类东西都不该触发 pnpm 的更新检查：
@@ -105,7 +135,9 @@ export function getPnpmGlobalPath(): string | null {
     CI: originalCi,
     PNPM_HOME: pnpmHome,
   } = process.env;
-  const configuredBinDirs = [pnpmHome, pnpmHome && path.join(pnpmHome, 'bin')];
+  const configuredBinDirs = pnpmHome
+    ? [pnpmHome, path.join(pnpmHome, 'bin')]
+    : [];
 
   const defaultHome = getPnpmHome();
 
@@ -142,24 +174,10 @@ export function getPnpmGlobalPath(): string | null {
     // 不抛出，返回 null，让 resolveGlobalPkgDir 回退到自行遍历全局根目录。
     return null;
   } finally {
-    if (originalPath === undefined) {
-      delete process.env.PATH;
-    } else {
-      process.env.PATH = originalPath;
-    }
-
-    if (originalGlobalBinDir === undefined) {
-      delete process.env.npm_config_global_bin_dir;
-    } else {
-      process.env.npm_config_global_bin_dir = originalGlobalBinDir;
-    }
-
-    if (originalCi === undefined) {
-      delete process.env.CI;
-    } else {
-      process.env.CI = originalCi;
-    }
-
+    restoreEnv('PATH', originalPath);
+    restoreEnv('npm_config_global_bin_dir', originalGlobalBinDir);
+    restoreEnv(CI_ENV, originalCi);
+    // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
     delete process.env[NO_UPDATE_NOTIFIER_ENV];
   }
 }
@@ -179,9 +197,7 @@ function getPnpmGlobalCandidates(): string[] {
 
   const detected = getPnpmGlobalPath();
 
-  return [...new Set([detected, ...versionDirs])].filter((dir): dir is string =>
-    Boolean(dir),
-  );
+  return [...new Set([detected, ...versionDirs])].filter(Boolean) as string[];
 }
 
 /**
@@ -287,7 +303,7 @@ async function resolveInVersionDir(
   }
 
   // pnpm 11：包位于 <root>/<virtualDir>/node_modules/<pkg>
-  const entries = await fs.readdir(root).catch(() => []);
+  const entries = await readDirEntries(root);
 
   return (
     (await firstDirectory(
@@ -351,7 +367,7 @@ export async function resolveGlobalDepotDir(): Promise<string | null> {
       path.join(versionDir, 'node_modules', '.pnpm', 'node_modules'),
     );
 
-    const entries = await fs.readdir(versionDir).catch((): string[] => []);
+    const entries = await readDirEntries(versionDir);
 
     for (const entry of entries) {
       candidates.push(
@@ -402,11 +418,11 @@ export async function createSymlink(
     throw new Error(`目标不存在: ${target}`);
   }
 
-  // 如果链接已存在，先删除
+  // 如果链接已存在，先删除（不存在的当它已经删掉了）
   await fs.unlink(link).catch((error) => {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw error;
-    } // 忽略文件不存在的错误
+    }
   });
 
   // 在 Windows 上使用 file 类型，因为我们链接的是可执行文件

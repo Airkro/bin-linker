@@ -110,8 +110,9 @@ async function linkMissingDeps(
   binEntries: Array<[string, string]>,
 ): Promise<boolean> {
   const depotDir = await resolveGlobalDepotDir();
-  const pkgJson = binEntries.length > 0 ? null : await readPackageJson(pkg);
-  const entry = binEntries[0]?.[1] ?? pkgJson?.main;
+  const pkgJson = binEntries[0]?.[1] ? null : await readPackageJson(pkg);
+  // 可执行入口优先（bin 指向空串的等于没声明），没有的话按 main 站在入口上试解析
+  const entry = binEntries[0]?.[1] || pkgJson?.main;
 
   if (!depotDir || !entry) {
     return false;

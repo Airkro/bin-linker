@@ -86,6 +86,46 @@ describe('cli', () => {
     expect(mocks.info).toHaveBeenCalledTimes(1);
   });
 
+  it('mentions dependency links right after the commands it fixed', async () => {
+    // 补依赖是对刚链接的命令做的补充动作，说明要紧跟在结果后面，
+    // 别等到后面的报错信息都念完了才提。
+    process.argv = ['node', 'bin-linker', 'tool', 'ghost'];
+    mocks.linkPackageBins.mockResolvedValue({
+      results: [
+        { pkg: 'tool', commands: ['tool'], depsLinked: true },
+        { pkg: 'ghost', notFound: true },
+      ],
+    });
+
+    await expect(run()).resolves.toBe(0);
+
+    const notified = mocks.info.mock.calls.find(([message]) =>
+      String(message).includes('补全依赖'),
+    );
+    const reported = mocks.warn.mock.calls.find(([message]) =>
+      String(message).includes('找不到包'),
+    );
+
+    expect(notified?.[0]).toContain('tool');
+    // 补依赖的说明先于后面那个包的结论
+    expect(mocks.info.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.warn.mock.invocationCallOrder[0] ?? Infinity,
+    );
+    expect(reported).toBeDefined();
+  });
+
+  it('does not mention dependency links when nothing was linked', async () => {
+    process.argv = ['node', 'bin-linker', 'tool'];
+    mocks.linkPackageBins.mockResolvedValue({
+      results: [{ pkg: 'tool', commands: [], noBin: true, depsLinked: true }],
+    });
+
+    await expect(run()).resolves.toBe(1);
+    expect(mocks.info).not.toHaveBeenCalledWith(
+      expect.stringContaining('补全'),
+    );
+  });
+
   it('fails when the pnpm global bin directory is missing from PATH', async () => {
     process.argv = ['node', 'bin-linker', 'tool'];
     mocks.linkPackageBins.mockResolvedValue({

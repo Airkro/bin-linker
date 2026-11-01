@@ -195,6 +195,161 @@ describe('linkPackageBins', () => {
     });
   });
 
+  it('stands on the package main entry when the package has no bin', async () => {
+    // 没有可执行文件的包，入口退回 package.json 的 main
+    mocks.resolveGlobalPkgDir.mockResolvedValue(
+      '/global/store/node_modules/tool',
+    );
+    mocks.realpath.mockResolvedValue('/real/store/node_modules/tool');
+    mocks.resolveGlobalDepotDir.mockResolvedValue('/global/.pnpm/node_modules');
+    mocks.readdir.mockResolvedValue(['missing-dep']);
+    mocks.readPackageJson.mockResolvedValue({
+      bin: { tool: 'tool.js' },
+      main: 'index.js',
+    });
+
+    await linkPackageBins(['tool']);
+
+    expect(mocks.symlink).toHaveBeenCalledWith(
+      '/global/.pnpm/node_modules/missing-dep',
+      path.join('/real/store/node_modules/tool', 'node_modules', 'missing-dep'),
+      'dir',
+    );
+  });
+
+  it('skips dependency linking when the package declares no entry at all', async () => {
+    // 既没有 bin 也没有 main：没有「站在哪解析依赖」这回事，依赖表连读都不用读
+    mocks.resolveGlobalPkgDir.mockResolvedValue(
+      '/global/store/node_modules/tool',
+    );
+    mocks.resolveGlobalDepotDir.mockResolvedValue('/global/.pnpm/node_modules');
+    mocks.readPackageJson.mockResolvedValue({});
+
+    await expect(linkPackageBins(['tool'])).resolves.toMatchObject({
+      results: [{ noBin: true }],
+    });
+    expect(mocks.readdir).not.toHaveBeenCalled();
+  });
+
+  it('skips dependency linking when there is no depot to link from', async () => {
+    mocks.readPackageJson.mockResolvedValue({ bin: { tool: 'tool.js' } });
+    mocks.resolveGlobalDepotDir.mockResolvedValue(null);
+
+    await expect(linkPackageBins(['tool'])).resolves.toMatchObject({
+      results: [{ commands: ['tool'], depsLinked: false }],
+    });
+    expect(mocks.readdir).not.toHaveBeenCalled();
+  });
+
+  it('skips dependency linking when the package bin points nowhere', async () => {
+    // 有依赖表，但 bin 指向空串：没有入口可站，就不用去读依赖表
+    mocks.readPackageJson.mockResolvedValue({ bin: { tool: '' } });
+    mocks.resolveGlobalDepotDir.mockResolvedValue('/global/.pnpm/node_modules');
+
+    await expect(linkPackageBins(['tool'])).resolves.toMatchObject({
+      results: [{ commands: ['tool'], depsLinked: false }],
+    });
+    expect(mocks.readdir).not.toHaveBeenCalled();
+  });
+
+  it('keeps the command link when the dependency pass blows up', async () => {
+    // 补依赖是附赠的，整段挂掉也不该把已经建好的命令链接连坐掉
+    mocks.readPackageJson.mockResolvedValue({ bin: { tool: 'tool.js' } });
+    mocks.resolveGlobalDepotDir.mockRejectedValue(new Error('boom'));
+
+    await expect(linkPackageBins(['tool'])).resolves.toMatchObject({
+      results: [{ commands: ['tool'], depsLinked: false }],
+    });
+  });
+
+  it('ignores dependency links that are already in place', async () => {
+    // 上一次补过的链接还在时不该重建：store 是共享的，重建是多余的写操作
+    mocks.resolveGlobalPkgDir.mockResolvedValue(
+      '/global/store/node_modules/tool',
+    );
+    mocks.realpath.mockResolvedValue('/real/store/node_modules/tool');
+    mocks.resolveGlobalDepotDir.mockResolvedValue('/global/.pnpm/node_modules');
+    mocks.readdir.mockResolvedValue(['linked-dep']);
+    mocks.lstat.mockResolvedValue({ isSymbolicLink: () => true });
+    mocks.readPackageJson.mockResolvedValue({ bin: { tool: 'tool.js' } });
+
+    const result = await linkPackageBins(['tool']);
+
+    expect(result.results[0]?.depsLinked).toBe(false);
+    expect(mocks.symlink).not.toHaveBeenCalledWith(
+      '/global/.pnpm/node_modules/linked-dep',
+      expect.anything(),
+      'dir',
+    );
+  });
+
+  it('swallows dependency link failures and keeps the command link', async () => {
+    // 补不上依赖不该连命令一起丢掉：链接已建好，缺哪个依赖让运行时照实报错
+    mocks.resolveGlobalPkgDir.mockResolvedValue(
+      '/global/store/node_modules/tool',
+    );
+    mocks.realpath.mockResolvedValue('/real/store/node_modules/tool');
+    mocks.resolveGlobalDepotDir.mockResolvedValue('/global/.pnpm/node_modules');
+    mocks.readdir.mockResolvedValue(['broken-dep']);
+    mocks.readPackageJson.mockResolvedValue({ bin: { tool: 'tool.js' } });
+    // 只有往包里补依赖的那次 symlink 失败（例如跨设备），命令链接本身照常建
+    mocks.symlink.mockImplementation(async (_target: string, link: string) => {
+      if (link.includes(`${path.sep}node_modules${path.sep}broken-dep`)) {
+        throw new Error('cross-device link');
+      }
+    });
+
+    await expect(linkPackageBins(['tool'])).resolves.toMatchObject({
+      results: [{ commands: ['tool'], depsLinked: false }],
+    });
+  });
+
+  it('falls back to the given directory when the store path cannot be resolved', async () => {
+    // realpath 失败（如链接已断）时按原路径继续，别把整次链接拖垮
+    mocks.resolveGlobalPkgDir.mockResolvedValue(
+      '/global/store/node_modules/tool',
+    );
+    mocks.realpath.mockRejectedValue(new Error('dangling'));
+    mocks.resolveGlobalDepotDir.mockResolvedValue('/global/.pnpm/node_modules');
+    mocks.readdir.mockResolvedValue(['missing-dep']);
+    mocks.readPackageJson.mockResolvedValue({ bin: { tool: 'tool.js' } });
+
+    await linkPackageBins(['tool']);
+
+    expect(mocks.symlink).toHaveBeenCalledWith(
+      '/global/.pnpm/node_modules/missing-dep',
+      path.join(
+        '/global/store/node_modules/tool',
+        'node_modules',
+        'missing-dep',
+      ),
+      'dir',
+    );
+  });
+
+  it('stands on the package main when there is no usable bin entry', async () => {
+    // 没声明 bin、或 bin 指向空串，都退回 main——否则这类包永远补不上依赖
+    const depLink = [
+      '/global/.pnpm/node_modules/missing-dep',
+      path.join(
+        '/global/node_modules/@scope/tool',
+        'node_modules',
+        'missing-dep',
+      ),
+      'dir',
+    ];
+
+    mocks.resolveGlobalDepotDir.mockResolvedValue('/global/.pnpm/node_modules');
+    mocks.readdir.mockResolvedValue(['missing-dep']);
+    mocks.readPackageJson.mockResolvedValue({ bin: '', main: 'main.js' });
+
+    // bin 是空串：命令名取包名、路径也算不出来，但 main 还在，能站上去解析
+    await expect(linkPackageBins(['@scope/tool'])).resolves.toMatchObject({
+      results: [{ commands: ['tool'] }],
+    });
+    expect(mocks.symlink).toHaveBeenCalledWith(...depLink);
+  });
+
   it('continues after package linking and metadata errors', async () => {
     mocks.readPackageJson
       .mockRejectedValueOnce(new Error('metadata failed'))
