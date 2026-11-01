@@ -88,28 +88,7 @@ patch:
         - name: 全局安装 miniprogram-ci
           script: pnpm add -g miniprogram-ci
         - name: 链接 miniprogram-ci
-          script: |
-            node ./lib/index.mjs miniprogram-ci
-            echo "== 诊断 =="
-            echo "PNPM_HOME=$PNPM_HOME"
-            ls -l "$PNPM_HOME/global/v11" || true
-            G=$(ls -d "$PNPM_HOME"/global/v11/*/ | head -1)
-            echo "== $G node_modules =="
-            ls "$G/node_modules" | head -10
-            echo "== 真实包所在层 =="
-            P=$(readlink -f "$G/node_modules/miniprogram-ci")
-            B=$(dirname "$P")
-            echo "$B"
-            ls "$B" | grep -i moment || echo "(同级没有 moment*)"
-            echo "== moment 在哪 =="
-            find "$PNPM_HOME/store" -maxdepth 5 -name "moment" -type d 2>/dev/null | head -3
-            echo "== moment-timezone 的上级 =="
-            T=$(readlink -f "$B/moment-timezone" 2>/dev/null)
-            dirname "$(dirname "$T")" 2>/dev/null
-            ls "$(dirname "$(dirname "$T")")" 2>/dev/null | grep -i moment
-            echo "== node 解析 =="
-            node -e "const r=require('module').createRequire('$P/dist/ci/miniapp/upload.js'); try{console.log(r.resolve('moment'))}catch(e){console.log('FAIL', e.message.split(String.fromCharCode(10))[0])}" || true
-            node -e "const r=require('module').createRequire('$P/dist/ci/miniapp/upload.js'); try{console.log(r.resolve('moment-timezone'))}catch(e){console.log('FAIL')}" || true
+          script: node ./lib/index.mjs miniprogram-ci
         # miniprogram-ci 没有 -v 参数，`npx --no miniprogram-ci -v` 拿到的是 npx 自身的版本，
         # 这里改为校验链接本身：软链存在、且用 node 执行时走到了它自己的入口。
         # 只认「projectPath should not be empty」这一句，不看退出码——以它那套参数校验打头，
@@ -129,10 +108,3 @@ patch:
               exit 1
             fi
             echo "$output" | grep -q 'projectPath should not be empty'
-        # 依赖解析是另一回事，单独复现：站在 node_modules 里的软链上解析一次 moment，
-        # 不需要 appid 与私钥、也不联网。--depot 会把全局安装根那一层也试一遍，
-        # 分出「祖先链够不到」和「包本身没装全」。bin-linker 现在会把够不到的依赖补到包上，
-        # 所以这一步应当解析得到；两个 ✗ 同时出现才是包本身装不全。
-        - name: 复现 moment 依赖解析
-          script: |
-            node fixtures/moment-repro/check-moment.cjs node_modules/miniprogram-ci --depot

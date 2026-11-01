@@ -1,14 +1,7 @@
 import { execSync } from 'node:child_process';
 import path from 'node:path';
 
-import { getPnpmHome } from './pnpm.mts';
-
-/** pnpm 10 起会校验的那个目录：全局 bin 目录本身与它下面的 `bin` */
-function globalBinDirs(): string[] {
-  const binDir = process.env.npm_config_global_bin_dir || getPnpmHome();
-
-  return [binDir, path.join(binDir, 'bin')];
-}
+import { getGlobalBinDirs } from './pnpm.mts';
 
 /**
  * 子进程用的环境：别改本进程，回滚一份全局状态的代价比设一次子进程环境大得多。
@@ -20,7 +13,7 @@ function globalBinDirs(): string[] {
  */
 function queryEnv(): Record<string, string> {
   const bins = [
-    ...globalBinDirs(),
+    ...getGlobalBinDirs(),
     ...(process.env.PATH ?? '').split(path.delimiter),
   ];
   const {

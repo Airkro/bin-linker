@@ -7,6 +7,7 @@ import {
   type PackageMeta,
 } from './fs.mts';
 import { getLayout, type PnpmLayout } from './layout.mts';
+import type { LocateFailure } from './result.mts';
 
 /** 可执行文件的名字与其在包里的相对位置 */
 export type BinEntry = [name: string, relPath: string];
@@ -31,18 +32,8 @@ type Picked = {
   bin?: PackageMeta['bin'];
 };
 
-/**
- * 没装上：包里没有可执行文件，或全局目录里压根找不到它。
- *
- * `globalBinDir` 与 `notFound` 之所以分开，是因为前者能修（`pnpm setup`），
- * 后者只能装上——CLI 给的提示完全不同。
- */
-export type LocateFailure = Pick<LinkPlan, 'pkgDirs'> & {
-  pkg: string;
-  noBin?: boolean;
-  notFound?: boolean;
-  globalBinDir?: boolean;
-};
+/** 一份计划，或者「没装上」的原因——两种结论都从这一个出口给出 */
+export type Planned = LinkPlan | LocateFailure;
 
 /**
  * 从布局的每一层里挑第一个读得到元数据的位置，链断了的那份自动落到下一个。
@@ -117,7 +108,7 @@ async function planDeps(
 export async function planPackageLinks(
   pkg: string,
   projectDir: string,
-): Promise<LinkPlan | LocateFailure> {
+): Promise<Planned> {
   // 布局与包无关，进程里只算一遍
   const { layers } = await getLayout();
   const pkgDirs = layers.map(({ pkgDir }) => path.join(pkgDir, pkg));

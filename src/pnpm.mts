@@ -21,7 +21,7 @@ export function getPnpmHome(): string {
 }
 
 /** pnpm 10 起会校验的那个目录：全局 bin 目录本身与它下面的 `bin` */
-function globalBinDirs(): string[] {
+export function getGlobalBinDirs(): string[] {
   const binDir = process.env.npm_config_global_bin_dir || getPnpmHome();
 
   return [binDir, path.join(binDir, 'bin')];
@@ -40,5 +40,5 @@ export function isBinDirMissingFromPath(): boolean {
       .map((entry) => path.resolve(entry || '.')),
   );
 
-  return globalBinDirs().every((dir) => !entries.has(path.resolve(dir)));
+  return getGlobalBinDirs().every((dir) => !entries.has(path.resolve(dir)));
 }

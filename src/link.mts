@@ -2,50 +2,14 @@ import path from 'node:path';
 
 import { promises as fs } from 'node:fs';
 
-import { createSymlink, ensureDir } from './fs.mts';
+import { createSymlink, ensureDir, settle } from './fs.mts';
 import { isBinDirMissingFromPath } from './pnpm.mts';
-import {
-  planPackageLinks,
-  type BinEntry,
-  type LinkPlan,
-  type LocateFailure,
-} from './plan.mts';
-
-/** 单个命令 / 单个依赖的成败 */
-type Failure = { name: string; error: Error };
-
-export type PkgResult = {
-  pkg: string;
-  /** 链接成功的命令名 */
-  commands?: string[];
-  /** 本次补上了包自己解析不到的依赖 */
-  depsLinked?: boolean;
-  errors?: Failure[];
-};
-
-/**
- * 每个包只能落在一种处境里。
- *
- * 处处都是 `?` 的对象谁都能拼出一个自相矛盾的结果（「找不到包」又「没有可执行文件」），
- * 读的人还得记住哪些字段互斥；用联合类型把这份约定交给编译器，下游按 `kind` 分派就行。
- */
-export type Outcome = LocateFailure | PkgResult;
+import { planPackageLinks, type BinEntry, type LinkPlan } from './plan.mts';
+import type { Failure, Outcome, PkgResult } from './result.mts';
 
 const projectDir = process.cwd();
 /** 链接落在工程自己的 `node_modules` 里，与包管理器装出来的一致 */
 const localBinDir = path.join(projectDir, 'node_modules', '.bin');
-
-/**
- * 做一件事，成与不成互不牵连：返回 `null` 表示成了，否则是败因。
- *
- * 建命令链接、补依赖都是这个形状：一件事成不成不取决于旁边那件。
- */
-function settle(task: Promise<unknown>): Promise<Error | null> {
-  return task.then(
-    () => null,
-    (error: Error) => error,
-  );
-}
 
 /** Windows 的 EPERM 只能靠管理员权限解决，交给 CLI 统一提示，别在这里吞掉 */
 function toFailure(name: string, error: unknown): Failure {

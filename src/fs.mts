@@ -24,6 +24,28 @@ export function readPackageJson(pkgDir: string): Promise<PackageMeta | null> {
     .catch(() => null);
 }
 
+/** 这一层在不在，并且里头有没有东西：空目录与不存在的目录一样，都当「没有」 */
+export async function hasEntries(dir: string): Promise<boolean> {
+  const [stat, names] = await Promise.all([
+    fs.stat(dir).catch(() => null),
+    readDir(dir),
+  ]);
+
+  return stat?.isDirectory() === true && names.length > 0;
+}
+
+/**
+ * 做一件事，成与不成互不牵连：返回 `null` 表示成了，否则是败因。
+ *
+ * 建命令链接、补依赖都是这个形状：一件事成不成不取决于旁边那件。
+ */
+export function settle(task: Promise<unknown>): Promise<Error | null> {
+  return task.then(
+    () => null,
+    (error: Error) => error,
+  );
+}
+
 /** 建目录（含父级）。建不成就当它不存在，由后面那一步报错 */
 export async function ensureDir(dir: string): Promise<void> {
   await fs.mkdir(dir, { recursive: true }).catch(() => undefined);

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   access: vi.fn(),
   mkdir: vi.fn(),
+  stat: vi.fn(),
   readFile: vi.fn(),
   readdir: vi.fn(),
   readlink: vi.fn(),
@@ -15,6 +16,7 @@ vi.mock('node:fs', () => ({
   promises: {
     access: mocks.access,
     mkdir: mocks.mkdir,
+    stat: mocks.stat,
     readFile: mocks.readFile,
     readdir: mocks.readdir,
     readlink: mocks.readlink,
@@ -27,10 +29,12 @@ vi.mock('node:fs', () => ({
 const {
   createSymlink,
   ensureDir,
+  hasEntries,
   linkPointsTo,
   readDir,
   readPackageJson,
   resolvePath,
+  settle,
 } = await import('../src/fs.mts');
 
 const LINK = '/project/node_modules/.bin/tool';
@@ -68,6 +72,34 @@ describe('filesystem helpers', () => {
     // 不存在与没权限在这里都是「没有」
     mocks.readdir.mockRejectedValueOnce(new Error('permission denied'));
     await expect(readDir('/global')).resolves.toEqual([]);
+  });
+
+  it('treats empty and unreadable directories as having nothing inside', async () => {
+    mocks.stat.mockResolvedValue({ isDirectory: () => true });
+
+    mocks.readdir.mockResolvedValueOnce(['pkg']);
+    await expect(hasEntries('/global')).resolves.toBe(true);
+
+    // pnpm 12 会留一个空的 `.pnpm/node_modules` 空壳：目录在不算数，里头有东西才算
+    mocks.readdir.mockResolvedValueOnce([]);
+    await expect(hasEntries('/global')).resolves.toBe(false);
+
+    // 路径被当成文件（store 里的包都是文件 / 目录混杂的地盘）
+    mocks.readdir.mockResolvedValueOnce(['x']);
+    mocks.stat.mockResolvedValueOnce({ isDirectory: () => false });
+    await expect(hasEntries('/global/file')).resolves.toBe(false);
+
+    // 读不到 stat（目录刚被 pnpm 切版本删掉）也当没有
+    mocks.readdir.mockResolvedValueOnce(['x']);
+    mocks.stat.mockRejectedValueOnce(new Error('missing'));
+    await expect(hasEntries('/global')).resolves.toBe(false);
+  });
+
+  it('turns a task into null on success and the cause on failure', async () => {
+    await expect(settle(Promise.resolve('done'))).resolves.toBeNull();
+
+    const error = new Error('nope');
+    await expect(settle(Promise.reject(error))).resolves.toBe(error);
   });
 
   it('falls back to the literal path when it cannot be resolved', async () => {

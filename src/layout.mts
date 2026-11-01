@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { readDir } from './fs.mts';
+import { hasEntries, readDir } from './fs.mts';
 import { getPnpmHome } from './pnpm.mts';
 import { queryGlobalRoot } from './query.mts';
 
@@ -61,16 +61,6 @@ async function findLayoutRoots(): Promise<string[]> {
       ...nested.flat(),
     ]),
   ];
-}
-
-/** 目录存在且里头有东西 */
-async function hasEntries(dir: string): Promise<boolean> {
-  const [stat, names] = await Promise.all([
-    fs.stat(dir).catch(() => null),
-    readDir(dir),
-  ]);
-
-  return stat?.isDirectory() === true && names.length > 0;
 }
 
 /** 布局给出的一份答案：包可能落在哪些目录，以及每个目录对应的依赖表 */

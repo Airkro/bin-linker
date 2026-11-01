@@ -20,6 +20,13 @@ vi.mock('../src/fs.mts', () => ({
   readDir: mocks.readDir,
   readPackageJson: mocks.readPackageJson,
   resolvePath: mocks.resolvePath,
+  // 只有一处实现，跟着被测代码走，不另立一份。
+  // 用真货而不是再 mock 一层：mock 出错时会被当成「链接失败」，测试照样绿
+  settle: (task: Promise<unknown>) =>
+    task.then(
+      () => null,
+      (error: Error) => error,
+    ),
 }));
 vi.mock('../src/layout.mts', () => ({ getLayout: mocks.getLayout }));
 vi.mock('../src/pnpm.mts', () => ({
