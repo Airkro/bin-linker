@@ -2,7 +2,7 @@ version: '1.0'
 
 patch:
   push:
-    # 原有环境镜像已失效，改用官方镜像还原 dockerfile 里的 pnpm 环境
+    # 原有环境镜像已失效，改用官方镜像 + corepack 还原 dockerfile 里的 pnpm 环境
     - name: 构建与测试
       runner:
         tags:
@@ -13,14 +13,24 @@ patch:
         # path 即容器内挂载点，不能与流水线挂入的 /workspace 互为包含，
         # 所以 pnpm 的 store 与全局目录都放在 /home/.share 下。
         volumes:
-          - /home/.share/pnpm:copy-on-write
+          - /home/.share:copy-on-write
       # 不能用 $PATH 拼接：声明在 env 里的 PATH 会先参与变量替换，
       # 此时 $PATH 还是空的，冒号后的内容会被当成命令执行。
       env:
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
         XDG_DATA_HOME: /home/.share
         PNPM_HOME: /home/.share/pnpm
         PATH: /home/.share/pnpm/bin:/home/.share/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       stages:
+        # node:lts-alpine 只自带 corepack，没有 pnpm。
+        # 不用 `npm i -g pnpm`：npm 的全局 bin 落在 /usr/local/bin，
+        # 而 pnpm 10 起要求 PNPM_HOME/bin 在 PATH 里才肯执行全局操作，
+        # 两套目录容易对不上，统一用 corepack 按 packageManager 字段准备版本。
+        - name: 启用 pnpm
+          script: |
+            mkdir -p "$PNPM_HOME/bin"
+            corepack enable --install-directory "$PNPM_HOME/bin"
+            pnpm -v # corepack 首次运行时会按 packageManager 自动准备版本
         - name: 预热 pnpm
           script: |
             pnpm config set store-dir /home/.share/pnpm/store --global
