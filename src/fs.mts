@@ -44,8 +44,31 @@ export function getPnpmHome(platform = process.platform): string {
 export const pnpmGlobalRoot = path.join(getPnpmHome(), 'global');
 
 /**
+ * corepack 的 shim 会把 stdin 读进内存再转给真实的包管理器
+ * （`dist/lib/corepack.cjs` 里等的是 `process.stdin` 的 `end`）。
+ * 父进程留着 stdin 不关时，子进程就一直等下去——CI 里就是这么挂满 10 分钟后
+ * 被当成「无输出」掐掉的（构建 cnb-951-1k6b80tj6）。查询不需要输入，给个空 stdin。
+ */
+const execOptions = { encoding: 'utf8', stdio: 'pipe' } as const;
+
+/**
+ * corepack 在 `CI` 置位时不会交互式问「是否下载」，而是直接去下载。
+ * 显式把 `CI` 交给它，别让它的行为取决于 runner 有没有设置这个变量。
+ */
+const CI_ENV = 'CI';
+
+/**
+ * 查询版本、`npm_config_*` 这类东西都不该触发 pnpm 的更新检查：
+ * 那是一次背景网络请求，断网时会把「查一下全局目录」拖成分钟级。
+ */
+const NO_UPDATE_NOTIFIER_ENV = 'npm_config_update_notifier';
+
+/**
  * pnpm 10 / pnpm 11 都会校验全局 bin 目录是否在 PATH，否则连 `root -g` 也报错。
- * 查询时临时把 pnpm 的相关目录补进 PATH，结束后恢复调用方的环境变量。
+ * 查询时临时把 pnpm 的相关目录补进 PATH，并清掉 `npm_config_global_bin_dir`：
+ * 那个变量是 pnpm 传给自己子进程的，只有当父进程已经校验过 PATH 才成立；
+ * 由 bin-linker 发起查询时它会盖掉这里补的目录，让校验直接失败。
+ * 结束后恢复调用方的环境变量。
  *
  * 返回 `pnpm root -g` 的全局根目录；查询失败（pnpm 不在 PATH 或校验不通过）
  * 时返回 null，由调用方回退到遍历 `<pnpmHome>/global` 自行查找。
@@ -53,14 +76,11 @@ export const pnpmGlobalRoot = path.join(getPnpmHome(), 'global');
 export function getPnpmGlobalPath(): string | null {
   const {
     PATH: originalPath,
-    npm_config_global_bin_dir: globalBinDir,
+    npm_config_global_bin_dir: originalGlobalBinDir,
+    CI: originalCi,
     PNPM_HOME: pnpmHome,
   } = process.env;
-  const configuredBinDirs = [
-    globalBinDir,
-    pnpmHome && path.join(pnpmHome, 'bin'),
-    pnpmHome,
-  ].filter(Boolean);
+  const configuredBinDirs = [pnpmHome, pnpmHome && path.join(pnpmHome, 'bin')];
 
   const defaultHome = getPnpmHome();
 
@@ -72,9 +92,12 @@ export function getPnpmGlobalPath(): string | null {
       ...pathEntries,
     ]),
   ].join(path.delimiter);
+  delete process.env.npm_config_global_bin_dir;
+  process.env[CI_ENV] = 'true';
+  process.env[NO_UPDATE_NOTIFIER_ENV] = 'false';
 
   try {
-    const output = execSync('pnpm root -g', { encoding: 'utf8' });
+    const output = execSync('pnpm root -g', execOptions);
     const paths = output
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -91,6 +114,20 @@ export function getPnpmGlobalPath(): string | null {
     } else {
       process.env.PATH = originalPath;
     }
+
+    if (originalGlobalBinDir === undefined) {
+      delete process.env.npm_config_global_bin_dir;
+    } else {
+      process.env.npm_config_global_bin_dir = originalGlobalBinDir;
+    }
+
+    if (originalCi === undefined) {
+      delete process.env.CI;
+    } else {
+      process.env.CI = originalCi;
+    }
+
+    delete process.env[NO_UPDATE_NOTIFIER_ENV];
   }
 }
 

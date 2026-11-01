@@ -11,7 +11,7 @@ const mocks = vi.hoisted(() => ({
   stat: vi.fn(),
   unlink: vi.fn(),
   symlink: vi.fn(),
-  execSync: vi.fn(() => '/global/node_modules\n'),
+  execSync: vi.fn((_command?: string, _options?: unknown) => '/global/node_modules\n'),
 }));
 
 vi.mock('node:child_process', () => ({ execSync: mocks.execSync }));
@@ -392,6 +392,62 @@ describe('filesystem helpers', () => {
     const fallbackFs = await import('../src/fs.mts?pnpm-root-fallback');
 
     expect(fallbackFs.getPnpmGlobalPath()).toBe('global root unavailable');
+  });
+
+  it('queries `pnpm root -g` without the inherited global bin dir and with a piped stdin', async () => {
+    const originalGlobalBinDir = process.env.npm_config_global_bin_dir;
+    const originalCi = process.env.CI;
+    const originalPnpmHome = process.env.PNPM_HOME;
+    process.env.npm_config_global_bin_dir = '/elsewhere/bin';
+    process.env.PNPM_HOME = '/pnpm-home';
+    delete process.env.CI;
+
+    try {
+      mocks.execSync.mockImplementation((command, options) => {
+        // pnpm 自己传下来的 npm_config_global_bin_dir 会覆盖补进 PATH 的目录，
+        // 让 pnpm 10 的 PATH 校验直接失败，查询时必须摘掉它。
+        expect(process.env.npm_config_global_bin_dir).toBeUndefined();
+        // corepack 只在 CI 置位时才不弹「是否下载」，别把行为赌在 runner 的变量上。
+        expect(process.env.CI).toBe('true');
+        // 更新检查是背景网络请求，断网时能把一次查询拖成分钟级。
+        expect(process.env.npm_config_update_notifier).toBe('false');
+        // 继承了永不关闭的 stdin 时，corepack shim 会一直等到它 end，execSync 就挂住了。
+        expect((options as { stdio?: string }).stdio).toBe('pipe');
+        expect(command).toBe('pnpm root -g');
+
+        return '/pnpm-home/global/v11/node_modules\n';
+      });
+      vi.resetModules();
+
+      // @ts-expect-error Vitest supports query strings for isolated module imports.
+      const queryFs = await import('../src/fs.mts?pnpm-query-env');
+
+      expect(queryFs.getPnpmGlobalPath()).toBe(
+        '/pnpm-home/global/v11/node_modules',
+      );
+      // 查询结束必须原样还回去，别污染调用方的环境
+      expect(process.env.npm_config_global_bin_dir).toBe('/elsewhere/bin');
+      expect(process.env.CI).toBeUndefined();
+      expect(process.env.npm_config_update_notifier).toBeUndefined();
+    } finally {
+      if (originalGlobalBinDir === undefined) {
+        delete process.env.npm_config_global_bin_dir;
+      } else {
+        process.env.npm_config_global_bin_dir = originalGlobalBinDir;
+      }
+      if (originalCi === undefined) {
+        delete process.env.CI;
+      } else {
+        process.env.CI = originalCi;
+      }
+      delete process.env.npm_config_update_notifier;
+      if (originalPnpmHome === undefined) {
+        delete process.env.PNPM_HOME;
+      } else {
+        process.env.PNPM_HOME = originalPnpmHome;
+      }
+      vi.resetModules();
+    }
   });
 
   it('falls back to scanning the global root when `pnpm root -g` fails', async () => {

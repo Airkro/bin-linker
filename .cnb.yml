@@ -45,12 +45,14 @@ patch:
         # 装 pnpm 本体和 shim 落到同一目录会自链成环（曾报 Symbolic link loop）。
         # 下载链路偶发静默挂住（曾撞上无输出超时，构建 cnb-q73-1k6agsf87），
         # 用 timeout 兜底：真挂住就尽快失败并打出是哪一步，别干等到天亮。
+        # --install-directory 给的是静态目录而不用 $PNPM_HOME：corepack 会把展开后的字面量
+        # 写进 shim 脚本，真出问题时直接在 shim 里就能看到它指向哪。
         - name: 安装 corepack
           script: |
             mkdir -p "$PNPM_HOME/bin"
             timeout 600 npm i -g corepack || { echo "npm corepack failed"; exit 1; }
             corepack --version
-            corepack enable --install-directory "$PNPM_HOME/bin"
+            corepack enable --install-directory /home/.share/pnpm/bin
         # 先把 pnpm 本体落进 corepack 的 cache：给出版本号而不是范围，
         # 省掉一次 registry 查询，也不依赖镜像的 dist-tags。
         # 顺带一条铁律：corepack 首次安装时要在 TTY 上问「是否下载」，CI 里无人应答会挂死，
@@ -60,7 +62,11 @@ patch:
             pnpm_version=$(node -p "require('./package.json').packageManager.split('@')[1]")
             echo "corepack installing pnpm@$pnpm_version from $COREPACK_NPM_REGISTRY"
             timeout 600 corepack install --global "pnpm@$pnpm_version" || { echo "corepack install failed"; exit 1; }
-            pnpm -v
+            echo "pnpm version: $(pnpm -v)"
+            echo "pnpm shim: $(readlink -f "$(command -v pnpm)")"
+            echo "corepack cache: $(ls "$COREPACK_HOME/v1/pnpm" 2>/dev/null | tr '\n' ' ')"
+            echo "corepack lastKnownGood: $(cat "$COREPACK_HOME/lastKnownGood.json" 2>/dev/null)"
+            echo "node: $(node -v), npm: $(npm -v)"
             # 下载走的是哪条链路，钉死在构建日志里。
             # 必须经 echo 输出：`npm config get` 的 stdout 不是 TTY 时不写终端，
             # 放在 stage 末尾等于什么都没有，最后一条命令无输出会撞上无输出超时。
