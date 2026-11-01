@@ -88,7 +88,23 @@ patch:
         - name: 全局安装 miniprogram-ci
           script: pnpm add -g miniprogram-ci
         - name: 链接 miniprogram-ci
-          script: node ./lib/index.mjs miniprogram-ci
+          script: |
+            node ./lib/index.mjs miniprogram-ci
+            echo "== 诊断 =="
+            ls -l "$PNPM_HOME/global/v11" || true
+            node -e "
+              const { getLayout } = await import('./lib/layout.mjs');
+              const { readDir } = await import('./lib/fs.mjs');
+              const { planPackageLinks } = await import('./lib/plan.mjs');
+              const { layers } = await getLayout();
+              for (const l of layers) {
+                const n = l.depot ? (await readDir(l.depot)).length : -1;
+                console.log('LAYER', l.pkgDir, 'depot=', l.depot, n);
+              }
+              const plan = await planPackageLinks('miniprogram-ci', process.cwd());
+              console.log('PKGDIR', plan.pkgDir);
+              console.log('DEPS', plan.deps?.length, 'moment', plan.deps?.some(d => d.link.endsWith('/moment')));
+            " --input-type=module || true
         # miniprogram-ci 没有 -v 参数，`npx --no miniprogram-ci -v` 拿到的是 npx 自身的版本，
         # 这里改为校验链接本身：软链存在、且用 node 执行时走到了它自己的入口。
         # 只认「projectPath should not be empty」这一句，不看退出码——以它那套参数校验打头，
