@@ -12,7 +12,7 @@ function nodeModulesIn(root: string): string {
     : path.join(root, 'node_modules');
 }
 
-/** 一个布局根下包可能待的两处固定位置，顺序即优先级；依赖表就是后面那一处 */
+/** 一个布局根下包可能待的两处固定位置，顺序即优先级 */
 function layersIn(root: string): [nodeModules: string, depot: string] {
   const nodeModules = nodeModulesIn(root);
 
@@ -63,11 +63,14 @@ async function findLayoutRoots(): Promise<string[]> {
   ];
 }
 
-async function isDirectory(dir: string): Promise<boolean> {
-  return fs.stat(dir).then(
-    (stat) => stat.isDirectory(),
-    () => false,
-  );
+/** 目录存在且里头有东西 */
+async function hasEntries(dir: string): Promise<boolean> {
+  const [stat, names] = await Promise.all([
+    fs.stat(dir).catch(() => null),
+    readDir(dir),
+  ]);
+
+  return stat?.isDirectory() === true && names.length > 0;
 }
 
 /** 布局给出的两份答案：包可能落在哪些目录、依赖表在哪一层 */
@@ -81,9 +84,13 @@ export type PnpmLayout = {
 async function readLayout(): Promise<PnpmLayout> {
   const roots = await findLayoutRoots();
   const layers = roots.map((root) => layersIn(root));
-  const depots = layers.map(([, depot]) => depot);
-  const found = await Promise.all(depots.map((dir) => isDirectory(dir)));
-  const index = found.indexOf(true);
+  // 依赖表从新到旧找第一个**非空**的。两层都算：pnpm 10/11 平铺在 `.pnpm/node_modules`，
+  // pnpm 12 起改成 public hoist 到布局根自己的 `node_modules` 顶层，同时留一个空的
+  // `.pnpm/node_modules` 空壳。只认「目录在不在」会挑中那个空壳，「缺哪些依赖」永远算成零个，
+  // 包一 require 间接依赖就断（miniprogram-ci 的 moment）。
+  const depots = layers.flat();
+  const filled = await Promise.all(depots.map((dir) => hasEntries(dir)));
+  const index = filled.indexOf(true);
 
   return {
     candidates: layers.flat(),

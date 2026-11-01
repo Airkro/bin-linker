@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
+  access: vi.fn(),
   mkdir: vi.fn(),
   readFile: vi.fn(),
   readdir: vi.fn(),
@@ -12,6 +13,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('node:fs', () => ({
   promises: {
+    access: mocks.access,
     mkdir: mocks.mkdir,
     readFile: mocks.readFile,
     readdir: mocks.readdir,
@@ -53,6 +55,8 @@ describe('filesystem helpers', () => {
       Object.assign(new Error('missing'), { code: 'ENOENT' }),
     );
     mocks.realpath.mockImplementation(async (target: string) => target);
+    // 默认：候选都存在
+    mocks.access.mockResolvedValue(undefined);
     mocks.unlink.mockResolvedValue(undefined);
     mocks.symlink.mockResolvedValue(undefined);
   });
@@ -113,13 +117,58 @@ describe('filesystem helpers', () => {
 
   it('leaves a link that already points at the target', async () => {
     // 重跑、`pnpm <cmd>` 前置钩子里链接已就位是常态，重建纯属两次多余的写操作
-    // readlink 先拿字面路径去比（省一次 realpath）——这里让字面路径就对得上
     readingOnly({ [LINK]: TARGET });
+    mocks.realpath.mockImplementation(async (target: string) =>
+      target === LINK ? TARGET : target,
+    );
 
     await createSymlink(LINK, [TARGET]);
     expect(mocks.unlink).not.toHaveBeenCalled();
     expect(mocks.symlink).not.toHaveBeenCalled();
-    expect(mocks.realpath).not.toHaveBeenCalled();
+  });
+
+  it('links the first target that actually exists', async () => {
+    // 候选表里常有不存在的层（pnpm 12 的 global/v11/node_modules 就只是个空壳），
+    // 照着排头建等于亲手做一条断链
+    mocks.access.mockImplementation(async (target: string) => {
+      if (target === TARGET) {
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      }
+    });
+
+    await createSymlink(LINK, [TARGET, '/global/10/node_modules/tool/cli.js']);
+    expect(mocks.symlink).toHaveBeenCalledWith(
+      '/global/10/node_modules/tool/cli.js',
+      LINK,
+      undefined,
+    );
+  });
+
+  it('fails when none of the targets exist', async () => {
+    mocks.access.mockRejectedValue(
+      Object.assign(new Error('missing'), { code: 'ENOENT' }),
+    );
+
+    await expect(createSymlink(LINK, [TARGET])).rejects.toThrow(
+      '候选位置都不存在',
+    );
+    expect(mocks.symlink).not.toHaveBeenCalled();
+  });
+
+  it('rebuilds a link whose target no longer exists', async () => {
+    // 空壳链接的字面路径恰好等于某个候选，只比字面路径就永远「已到位」，
+    // 于是断链一直留着——用户看到的就是一条跑不起来的软链
+    readingOnly({ [LINK]: TARGET });
+    mocks.realpath.mockImplementation(async (target: string) => {
+      if (target === LINK) {
+        throw Object.assign(new Error('dangling'), { code: 'ENOENT' });
+      }
+
+      return target;
+    });
+
+    await createSymlink(LINK, [TARGET]);
+    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, undefined);
   });
 
   it('accepts any of the candidate targets', async () => {

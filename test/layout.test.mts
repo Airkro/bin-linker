@@ -174,6 +174,11 @@ describe('pnpm global layout', () => {
         mocks.execSync.mockImplementationOnce(
           () => '/pnpm-home/global/v11/node_modules\n',
         );
+        // 依赖表得真有东西，且优先 `node_modules` 与 `.pnpm/node_modules` 里先出现的那个；
+        // 两处都有时取 `node_modules`（直接依赖那层）
+        mocks.readdir.mockImplementation(async (dir: string) =>
+          dir.endsWith('.pnpm/node_modules') ? ['dep'] : [],
+        );
 
         await expect(api.getLayout()).resolves.toEqual({
           candidates: candidatesOf('/pnpm-home/global/v11/node_modules'),
@@ -407,7 +412,11 @@ describe('pnpm global layout', () => {
         return ['v11'];
       }
 
-      return dir === versionDir ? ['older', 'newer'] : [];
+      if (dir === versionDir) {
+        return ['older', 'newer'];
+      }
+
+      return dir.endsWith('.pnpm/node_modules') ? ['dep'] : [];
     });
     const tree = {
       // 版本目录自身的 node_modules 在这里不存在，只有哈希目录下面那层有依赖表
@@ -427,6 +436,19 @@ describe('pnpm global layout', () => {
     // 每装一次都可能多一张表，新到旧地排着，谁先谁后由 mtime 决定
     await expect(api.getLayout()).resolves.toMatchObject({
       depot: path.join(newer, '.pnpm', 'node_modules'),
+    });
+  });
+
+  it('skips a dependency table that exists but holds nothing', async () => {
+    // pnpm 12 把依赖 public hoist 到全局安装根自己的 node_modules 顶层，
+    // 同时留下一个空的 `.pnpm/node_modules`：只认「目录在不在」会挑中空壳
+    await withEnv({ PNPM_HOME: '/pnpm-home' }, async () => {
+      mocks.execSync.mockReturnValue('');
+      mocks.readdir.mockResolvedValue([]);
+      mocks.stat.mockResolvedValue(isDir);
+
+      // 根目录下全是空表：宁可没有，也别拿空壳去算「缺哪些依赖」
+      await expect(api.getLayout()).resolves.toMatchObject({ depot: null });
     });
   });
 

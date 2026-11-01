@@ -47,26 +47,33 @@ function getLinkType(
   return path.extname(target) ? 'file' : 'junction';
 }
 
+/** 候选里第一份真在的；一份都没有时返回 null */
+async function firstPresent(targets: string[]): Promise<string | null> {
+  for (const target of targets) {
+    const present = await fs.access(target).then(
+      () => true,
+      () => false,
+    );
+
+    if (present) {
+      return target;
+    }
+  }
+
+  return null;
+}
+
 /**
  * 链接是否已经指着 `targets` 里的某一份；不是链接（不存在、或是被解压进来的普通目录）就算没到位。
  *
- * 字面路径对得上就不用再解析；解析不到时说明链接是空壳，拿字面路径去比正好对得上，
- * 于是永远不重建——所以两边都得解析成功才算数。
+ * 两边都必须解析成功才算数，字面路径对得上不算：链接是个空壳时（包被挪走了、
+ * 或上一次指到一份不存在的候选上），它的字面路径恰好等于某个候选，
+ * 拿字面路径去比就永远「已到位」，于是再也不重建——用户看到的就是一条断链。
  */
 export async function linkPointsTo(
   link: string,
   targets: string[],
 ): Promise<boolean> {
-  const current = await fs.readlink(link).catch(() => null);
-
-  if (!current) {
-    return false;
-  }
-
-  if (targets.includes(current)) {
-    return true;
-  }
-
   const [realLink, realTargets] = await Promise.all([
     fs.realpath(link).catch(() => null),
     Promise.all(targets.map((target) => resolvePath(target))),
@@ -76,11 +83,14 @@ export async function linkPointsTo(
 }
 
 /**
- * 把 `link` 指向 `targets` 里第一个能用的那一份，已经指着其中任意一份就跳过。
+ * 把 `link` 指向 `targets` 里第一份真在的东西，已经指着其中任意一份就跳过。
  *
  * `targets` 是同一个东西的多个候选位置（包可能同时留在几个版本目录里）。
  * 重跑、`pnpm <cmd>` 前置钩子里链接已就位是常态，而 unlink + symlink
  * 是两次写操作，还会让链接短暂消失。
+ *
+ * 建链的对象必须挑一份存在的：候选表里常有不存在的层（pnpm 12 的
+ * `global/v11/node_modules` 就只是个空壳），照着排头建等于亲手做一条断链。
  */
 export async function createSymlink(
   link: string,
@@ -90,14 +100,18 @@ export async function createSymlink(
     return;
   }
 
+  const target = await firstPresent(targets);
+
+  if (!target) {
+    throw new Error(`候选位置都不存在: ${targets.join(', ')}`);
+  }
+
   // 不存在的链接当它已经删掉了
   await fs.unlink(link).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== 'ENOENT') {
       throw error;
     }
   });
-
-  const [target] = targets as [string];
 
   await fs.symlink(target, link, getLinkType(target));
 }
