@@ -59,8 +59,9 @@ describe('filesystem helpers', () => {
       Object.assign(new Error('missing'), { code: 'ENOENT' }),
     );
     mocks.realpath.mockImplementation(async (target: string) => target);
-    // 默认：候选都存在
+    // 默认：候选都存在，且都是普通文件（空壳目录的用例自己改）
     mocks.access.mockResolvedValue(undefined);
+    mocks.stat.mockImplementation(async () => ({ isDirectory: () => false }));
     mocks.unlink.mockResolvedValue(undefined);
     mocks.symlink.mockResolvedValue(undefined);
   });
@@ -174,6 +175,51 @@ describe('filesystem helpers', () => {
       LINK,
       undefined,
     );
+  });
+
+  it('skips an empty shell and links the next target with content', async () => {
+    // pnpm 12 的 `global/v11/node_modules` 探得到、里头什么都没有：照着排头建，
+    // 链过去的是一条空壳，命令照样起不来
+    const shell = '/global/v11/node_modules/tool';
+    const real = '/global/v11/abc123/node_modules/tool';
+
+    mocks.access.mockImplementation(async (target: string) => {
+      if (target !== shell && target !== real) {
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      }
+    });
+    mocks.stat.mockImplementation(async () => ({ isDirectory: () => true }));
+    mocks.readdir.mockImplementation(async (dir: string) =>
+      dir === real ? ['package.json'] : [],
+    );
+
+    await createSymlink(LINK, [shell, real]);
+    expect(mocks.symlink).toHaveBeenCalledWith(real, LINK, undefined);
+  });
+
+  it('accepts a target that is itself a link', async () => {
+    // pnpm 12 的全局安装根常把整层 `node_modules` 做成软链（`global/v11/node_modules`），
+    // 解到根是一份按内容寻址命名的目录，每次安装都换名字；
+    // 只比解到根的路径，指着同一条软链也会判成「不在位」，于是每次运行都重建
+    const layer = '/global/v11/node_modules/tool';
+    readingOnly({ [layer]: '/global/v11/abc123/node_modules/tool' });
+    mocks.realpath.mockImplementation(async (dir: string) =>
+      dir === '/project/node_modules/tool' ? layer : dir,
+    );
+
+    await expect(
+      linkPointsTo('/project/node_modules/tool', [layer]),
+    ).resolves.toBe(true);
+  });
+
+  it('treats a target it cannot stat as a plain entry', async () => {
+    // 探得到（access 过了）却 stat 不到：断链一类。当文件放行，别把它当空壳跳过
+    mocks.stat.mockRejectedValue(
+      Object.assign(new Error('dangling'), { code: 'ENOENT' }),
+    );
+
+    await createSymlink(LINK, [TARGET]);
+    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, undefined);
   });
 
   it('fails when none of the targets exist', async () => {

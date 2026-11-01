@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { hasEntries, readDir } from './fs.mts';
+import { hasEntries, isPackageEntry, readDir } from './fs.mts';
 import { getPnpmHome } from './pnpm.mts';
 import { queryGlobalRoot } from './query.mts';
 
@@ -20,19 +20,37 @@ function layersIn(root: string): [nodeModules: string, depot: string] {
 }
 
 /**
- * 按 mtime 从新到旧排好的子目录，文件与读不到的排掉。
+ * 一个子目录的 mtime；文件、读不到的（`pnpm` 读到一半就删掉了）给 -1。
  *
- * 目录可能在被读到的下一瞬就没了（`pnpm` 正在切版本），`stat` 失败一律当作不存在。
- * 先 stat 再 filter：一次全量 stat 就能把两种结局都定下来，不必再探一遍目录。
+ * 读到的可能是软链，要的是它指向的目录的 mtime：`pnpm global add` 装完之后
+ * 还会在版本目录里改一次 `lastKnownGood` 软链，那一下落的 mtime 比内容本身新得多。
+ * 按软链自己那条排，刚装好这个包的目录会沉到后面去，挑中它前面那份没有这个包的
+ * 旧布局，补依赖算出来是零（`Cannot find module 'moment'` 就是这么断的）。
  */
+async function mtimeOf(child: string): Promise<number> {
+  const stat = await fs.stat(child).catch(() => null);
+
+  if (stat === null) {
+    return -1;
+  }
+
+  // 软链读的是它指向的目录；指到文件上、或那份已经不在了，都当它不在这儿
+  const target =
+    typeof stat.isSymbolicLink === 'function' && stat.isSymbolicLink()
+      ? await fs.stat(child).catch(() => null)
+      : stat;
+
+  return target?.isDirectory() === true ? target.mtimeMs : -1;
+}
+
+/** 按 mtime 从新到旧排好的子目录，文件与读不到的排掉 */
 async function dirsByMtime(dir: string): Promise<string[]> {
   const names = await readDir(dir);
   const entries = await Promise.all(
     names.map(async (name) => {
       const child = path.join(dir, name);
-      const stat = await fs.stat(child).catch(() => null);
 
-      return { child, mtime: stat?.isDirectory() ? stat.mtimeMs : -1 };
+      return { child, mtime: await mtimeOf(child) };
     }),
   );
 
@@ -86,15 +104,15 @@ export type PnpmLayout = {
  */
 async function isAliasTable(dir: string): Promise<boolean> {
   const entries = await readDir(dir);
-  const names = entries.filter((name) => !name.startsWith('.'));
-
-  if (names.length === 0) {
-    return false;
-  }
+  const names = entries.filter(isPackageEntry);
 
   const links = await Promise.all(
     names.map((name) =>
-      fs.lstat(path.join(dir, name)).then((stat) => stat.isSymbolicLink()),
+      // 条目可能刚被 pnpm 删掉（正在切版本）：当它不是软链
+      fs.lstat(path.join(dir, name)).then(
+        (stat) => stat.isSymbolicLink(),
+        () => false,
+      ),
     ),
   );
 

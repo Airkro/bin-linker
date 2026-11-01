@@ -31,6 +31,12 @@ const isDirWithMtime = (mtimeMs: number) => ({
   isDirectory: () => true,
   mtimeMs,
 });
+/** 带「是不是软链」答案的目录，排序要认的那个 */
+const isDirWith = (mtimeMs: number, isLink = false) => ({
+  isDirectory: () => true,
+  isSymbolicLink: () => isLink,
+  mtimeMs,
+});
 
 /** 借一个用例体改环境变量，结束后归还 */
 async function withEnv(
@@ -535,6 +541,199 @@ describe('pnpm global layout', () => {
     expect(layers).toEqual(
       expect.arrayContaining([layerOf(real, nestedOf(real))]),
     );
+  });
+
+  it('orders version entries by the content, not by the mtime of the link', async () => {
+    // `pnpm global add` 装完会在版本目录里改一次 `lastKnownGood` 软链，那一下的 mtime
+    // 比内容本身新。按软链自己那条排，它指向的那份会顶到最前面，
+    // 于是挑中一份对不上这个包的布局，补依赖算出来是零（moment 就是这么断的）
+    const globals = path.join(getPnpmHome(), 'global');
+    const version = path.join(globals, 'v11');
+    const stale = path.join(version, 'stale');
+    const linked = path.join(version, 'lkg');
+
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      if (dir === globals) {
+        return ['v11'];
+      }
+
+      return dir === version ? ['stale', 'lkg'] : [];
+    });
+    mocks.stat.mockReset();
+    // lkg 问两遍：第一遍是它自己（软链，50），第二遍是它指向的那份（10）
+    let asked = 0;
+    mocks.stat.mockImplementation(async (entry: string) => {
+      if (entry === version) {
+        return isDirWith(1);
+      }
+
+      if (entry === stale) {
+        return isDirWith(20);
+      }
+
+      asked += 1;
+
+      return isDirWith(asked === 1 ? 50 : 10, asked === 1);
+    });
+
+    const { layers } = await api.getLayout();
+    const order = layers.map(({ pkgDir }) => pkgDir);
+
+    // 软链那一下的 mtime 不作数：拿它排，lkg（50）会排到 stale（20）前面
+    expect(order.indexOf(path.join(stale, 'node_modules'))).toBeLessThan(
+      order.indexOf(path.join(linked, 'node_modules')),
+    );
+  });
+
+  it('counts a table holding only dot entries as empty', async () => {
+    // 只有 `.bin`、`.modules.yaml` 这类元数据的层不是依赖表：
+    // 拿它去算「缺哪些」，一个依赖都算不出来
+    const globals = path.join(getPnpmHome(), 'global');
+    const root = path.join(globals, 'v11');
+    const dots = path.join(root, 'node_modules');
+
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      if (dir === globals) {
+        return ['v11'];
+      }
+
+      return dir === dots ? ['.bin', '.modules.yaml'] : [];
+    });
+    mocks.stat.mockReset();
+    fakeFs({ [root]: isDirWithMtime(1), [dots]: isDir });
+
+    // 整层只有元数据：认得出那里没有表（不该拿它当表去算依赖），
+    // 但包还得照旧在那一层里找
+    const { layers } = await api.getLayout();
+
+    expect(layers.map(({ pkgDir }) => pkgDir)).toEqual([dots]);
+    expect(layers.every(({ depot }) => depot === null)).toBe(true);
+  });
+
+  it('skips a table whose lstat cannot resolve an entry', async () => {
+    // 读到目录又扫到条目之后，pnpm 可能正在删其中一条（切版本）：
+    // 探不到就当作不是软链，别把整次探测炸掉
+    const globals = path.join(getPnpmHome(), 'global');
+    const root = path.join(globals, 'v11');
+    const table = path.join(root, 'node_modules');
+
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      if (dir === globals) {
+        return ['v11'];
+      }
+
+      return dir === table ? ['tool'] : [];
+    });
+    mocks.stat.mockReset();
+    fakeFs({ [root]: isDirWithMtime(1), [table]: isDir });
+    mocks.lstat.mockRejectedValue(
+      Object.assign(new Error('gone'), { code: 'ENOENT' }),
+    );
+
+    const { layers } = await api.getLayout();
+
+    expect(layers.map(({ depot }) => depot)).toEqual([table]);
+  });
+
+  it('looks at one dependency table when the layer has no nested one', async () => {
+    // 没有 `.pnpm/node_modules` 的层（pnpm 10 的全局根）：顶层那张表就是唯一的表，
+    // 别为了探第二处把同一个目录的名字读两遍
+    const globals = path.join(getPnpmHome(), 'global');
+    const root = path.join(globals, '10');
+    const table = path.join(root, 'node_modules');
+
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      if (dir === globals) {
+        return ['10'];
+      }
+
+      return dir === table ? ['tool'] : [];
+    });
+    mocks.stat.mockReset();
+    fakeFs({ [root]: isDirWithMtime(1), [table]: isDir });
+
+    const { layers } = await api.getLayout();
+
+    expect(layers.map(({ depot }) => depot)).toEqual([table]);
+  });
+
+  it('does not ask whether a table holding only dot entries is an alias', async () => {
+    // 只有元数据的层没有条目可查，元数据本身不该被当成包
+    const globals = path.join(getPnpmHome(), 'global');
+    const root = path.join(globals, 'v11');
+    const table = path.join(root, 'node_modules');
+
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      if (dir === globals) {
+        return ['v11'];
+      }
+
+      return dir === table ? ['.bin'] : [];
+    });
+    mocks.stat.mockReset();
+    fakeFs({ [root]: isDirWithMtime(1), [table]: isDir });
+    mocks.lstat.mockClear();
+
+    const { layers } = await api.getLayout();
+
+    expect(layers.every(({ depot }) => depot === null)).toBe(true);
+    expect(mocks.lstat).not.toHaveBeenCalledWith(path.join(table, '.bin'));
+  });
+
+  it('drops a link whose target is gone or is a file', async () => {
+    // lastKnownGood 这类软链可能指向一份被删掉的目录，也可能指到文件上：都不算目录
+    const globals = path.join(getPnpmHome(), 'global');
+    const version = path.join(globals, 'v11');
+    const broken = path.join(version, 'broken');
+    const toFile = path.join(version, 'to-file');
+
+    mocks.execSync.mockReturnValue('');
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      if (dir === version) {
+        return ['broken', 'to-file'];
+      }
+
+      return dir === globals ? ['v11'] : [];
+    });
+    mocks.stat.mockReset();
+    // 每个软链问两次：先问「你是什么」，再问「你指向的那份是什么」
+    const asked = new Map<string, number>();
+    mocks.stat.mockImplementation(async (entry: string) => {
+      if (entry === version) {
+        return isDirWith(1);
+      }
+
+      if (entry === broken || entry === toFile) {
+        const times = (asked.get(entry) ?? 0) + 1;
+
+        asked.set(entry, times);
+
+        if (times === 1) {
+          return { isDirectory: () => true, isSymbolicLink: () => true };
+        }
+
+        // broken 指向的已经不在了；to-file 指向一个文件
+        if (entry === broken) {
+          throw new Error('missing');
+        }
+
+        return { isDirectory: () => false, isSymbolicLink: () => false };
+      }
+
+      throw new Error(`unexpected: ${entry}`);
+    });
+
+    const { layers } = await api.getLayout();
+
+    // 断链、指到文件的都排掉，只剩版本目录那一层
+    expect(layers.map(({ pkgDir }) => pkgDir)).toEqual([
+      path.join(version, 'node_modules'),
+    ]);
   });
 
   it('skips a dependency table that exists but holds nothing', async () => {
