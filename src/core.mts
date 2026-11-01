@@ -1,59 +1,50 @@
-import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { createRequire } from 'node:module';
+import path from 'node:path';
 
 import {
   createSymlink,
   ensureDir,
-  isPnpmBinDirMissingFromPath,
   isWindows,
   localBinDir,
   readPackageJson,
+  type PackageMeta,
+} from './fs.mts';
+import {
+  isPnpmBinDirMissingFromPath,
   resolveGlobalDepotDir,
   resolveGlobalPkgDir,
-} from './fs.mts';
+} from './pnpm.mts';
 
-type PkgError = { name: string; error: Error };
-
-type PkgResult = {
+export type PkgResult = {
   pkg: string;
+  /** 链接成功的命令名 */
   commands?: string[];
+  /** 全局目录里找不到这个包 */
   notFound?: boolean;
+  /** 包没有可执行文件 */
   noBin?: boolean;
+  /** pnpm 的全局 bin 目录不在 PATH，定位不了包 */
   globalBinDir?: boolean;
-  errors?: PkgError[];
-  /** 依赖来自全局安装根（pnpm 全局布局下包自身的祖先链够不到它）时为 true */
+  errors?: Array<{ name: string; error: Error }>;
+  /** 本次补上了包自己解析不到的依赖 */
   depsLinked?: boolean;
 };
 
+/** `bin` 是字符串时命令名取包名（去掉 scope 前缀） */
 function getBinEntries(
   pkg: string,
-  bin: string | Record<string, string> | undefined,
+  bin: PackageMeta['bin'],
 ): Array<[string, string]> {
   if (typeof bin === 'string') {
-    return [[path.basename(pkg), bin]];
+    return [[pkg.split('/').at(-1) as string, bin]];
   }
 
   return Object.entries(bin ?? {});
 }
 
-/**
- * 安全删除文件（忽略文件不存在的错误）
- */
-async function safeUnlink(filePath: string): Promise<void> {
-  try {
-    await fs.unlink(filePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw error;
-    }
-  }
-}
-
-/**
- * 处理Windows权限错误
- */
-function handleWindowsPermError(error: unknown): Error {
+/** Windows 的 EPERM 要靠管理员权限解决，其它错误在本地处理掉 */
+function rethrowPermissions(error: unknown): Error {
   if (isWindows && (error as NodeJS.ErrnoException).code === 'EPERM') {
     throw error;
   }
@@ -61,156 +52,132 @@ function handleWindowsPermError(error: unknown): Error {
   return error as Error;
 }
 
-/**
- * 链接单个包
- */
-async function linkPackage(pkg: string, pkgDir: string): Promise<boolean> {
-  const packageTarget = pkgDir;
-  const packageLink = path.join(process.cwd(), 'node_modules', pkg);
-
-  await ensureDir(path.dirname(packageLink));
+/** 把全局包链进工程的 `node_modules`，让运行时能按包名找到它 */
+async function linkPackage(pkgDir: string, pkg: string): Promise<void> {
+  const link = path.join(process.cwd(), 'node_modules', pkg);
 
   try {
-    await safeUnlink(packageLink);
-    const type = isWindows ? 'junction' : 'dir';
-    await fs.symlink(packageTarget, packageLink, type);
-
-    return true;
+    await ensureDir(path.dirname(link));
+    // 上一次的链接（或残留目录）先删掉，重跑才是幂等的
+    await fs.unlink(link).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+    });
+    await fs.symlink(pkgDir, link, isWindows ? 'junction' : 'dir');
   } catch (error) {
-    throw handleWindowsPermError(error);
-  }
-}
-
-/**
- * 站在某个文件的位置解析依赖，解析不到时返回 null。
- */
-function resolveFrom(from: string, request: string): string | null {
-  try {
-    return createRequire(from).resolve(request);
-  } catch {
-    return null;
+    // 包链接失败只影响这一个包，按包记账即可；Windows 的 EPERM 要靠管理员权限解决，
+    // 混进「这个包链接失败」里没人看得懂，交给 CLI 统一提示。
+    throw rethrowPermissions(error);
   }
 }
 
 /**
  * 把包自己解析不到的依赖补进它的 `node_modules`。
  *
- * pnpm 的全局安装把真实包放在 store 里（`<pkgDir>` 就是指向 store 的软链），
- * 依赖则平铺在全局安装根的 `.pnpm/node_modules`。node 按真实路径向上找依赖，
- * 从 store 那一层往上走够不到全局安装根，包一 require 间接依赖就 MODULE_NOT_FOUND
- * （miniprogram-ci 的 moment 就是这么断的）。
+ * pnpm 全局安装把真实包放在 store 里，依赖平铺在全局安装根的 `.pnpm/node_modules`。
+ * node 按真实路径向上找依赖，从 store 那一层往上够不到全局安装根，包一 require
+ * 间接依赖就 MODULE_NOT_FOUND（miniprogram-ci 的 moment 就是这么断的）。
+ * 这里补一层 `node_modules` 指回那张表，只补真正解析不到的：能解析的一概不动。
  *
- * 所以在真实包的目录里补一层 `node_modules`，每个包指回全局安装根那张表——
- * 与工程里 `node_modules/<pkg>/node_modules/<dep>` 的解析方式一致。
- * 只补真正解析不到的包：先站在包的入口上试一次，能解析的一概不动。
+ * 返回是否真的补上了东西；补不上不算错误，命令链接已经建好，缺哪个依赖交给运行时照实报错。
  */
-async function linkMissingDeps(
-  pkg: string,
+export async function linkMissingDeps(
   pkgDir: string,
-  binEntries: Array<[string, string]>,
+  entry: string | undefined,
 ): Promise<boolean> {
-  const depotDir = await resolveGlobalDepotDir();
-  const pkgJson = binEntries[0]?.[1] ? null : await readPackageJson(pkg);
-  // 可执行入口优先（bin 指向空串的等于没声明），没有的话按 main 站在入口上试解析
-  const entry = binEntries[0]?.[1] || pkgJson?.main;
+  const depotDir = entry && (await resolveGlobalDepotDir());
 
-  if (!depotDir || !entry) {
+  if (!depotDir) {
     return false;
   }
 
   const realPkgDir = await fs.realpath(pkgDir).catch(() => pkgDir);
-  const entryFile = path.join(realPkgDir, entry);
   const depsNodeModules = path.join(realPkgDir, 'node_modules');
+  const resolveFrom = createRequire(path.join(realPkgDir, entry));
+  const canResolve = (dep: string): boolean => {
+    try {
+      resolveFrom.resolve(dep);
 
-  const deps = await fs.readdir(depotDir).catch((): string[] => []);
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   let linked = false;
 
-  for (const dep of deps) {
-    // 已经解析得到的、上一次补过的，都不动，要补的只是少数几个
-    const todo = !resolveFrom(entryFile, dep);
-    const link = path.join(depsNodeModules, dep);
-
-    if (todo && !(await fs.lstat(link).catch(() => null))) {
-      try {
+  for (const dep of await fs.readdir(depotDir).catch((): string[] => [])) {
+    try {
+      // 已经解析得到的、上一次补过的，都不动，要补的只是少数几个
+      if (
+        !canResolve(dep) &&
+        !(await fs.lstat(path.join(depsNodeModules, dep)).catch(() => null))
+      ) {
         await ensureDir(depsNodeModules);
-        await fs.symlink(path.join(depotDir, dep), link, 'dir');
+        await fs.symlink(
+          path.join(depotDir, dep),
+          path.join(depsNodeModules, dep),
+          'dir',
+        );
         linked = true;
-      } catch {
-        // 补不上就算了：链接本身已经建好，缺哪个依赖交给运行时照实报错。
       }
+    } catch {
+      // 补不上就算了：链接本身已经建好，缺哪个依赖交给运行时照实报错。
     }
   }
 
   return linked;
 }
 
-/**
- * 链接单个包的可执行文件
- */
 async function linkPackageBin(pkg: string): Promise<PkgResult> {
   const pkgDir = await resolveGlobalPkgDir(pkg);
 
   if (!pkgDir) {
     // 全局 bin 目录不在 PATH 时 pnpm 自身的全局目录查询会失效，
-    // 此时多半是把「环境没配好」误报成「包没安装」，需要区分提示。
-    if (isPnpmBinDirMissingFromPath()) {
-      return { pkg, commands: [], globalBinDir: true };
-    }
-
-    return { pkg, commands: [], notFound: true };
+    // 此时多半是把「环境没配好」误报成「包没安装」。
+    return isPnpmBinDirMissingFromPath()
+      ? { pkg, globalBinDir: true }
+      : { pkg, notFound: true };
   }
 
-  const pkgJson = await readPackageJson(pkg);
-
-  if (!pkgJson) {
-    return { pkg, commands: [], notFound: true };
-  }
+  const pkgJson = await readPackageJson(pkgDir);
+  const binEntries = getBinEntries(pkg, pkgJson?.bin);
 
   try {
-    await linkPackage(pkg, pkgDir);
+    await linkPackage(pkgDir, pkg);
   } catch (error) {
-    return {
-      pkg,
-      commands: [],
-      errors: [{ name: pkg, error: error as Error }],
-    };
+    return { pkg, errors: [{ name: pkg, error: error as Error }] };
   }
 
-  const binEntries = getBinEntries(pkg, pkgJson.bin);
-
   if (binEntries.length === 0) {
-    return { pkg, commands: [], noBin: true };
+    return { pkg, noBin: true };
   }
 
   const result: PkgResult = {
     pkg,
     commands: [],
     errors: [],
-    depsLinked: await linkMissingDeps(pkg, pkgDir, binEntries).catch(
+    depsLinked: await linkMissingDeps(pkgDir, binEntries[0]?.[1]).catch(
       () => false,
     ),
   };
 
   for (const [name, relPath] of binEntries) {
-    const target = path.join(pkgDir, relPath);
-    const link = path.join(localBinDir, name);
-
     try {
-      await createSymlink(target, link);
-      (result.commands ??= []).push(name);
+      await createSymlink(
+        path.join(pkgDir, relPath),
+        path.join(localBinDir, name),
+      );
+      result.commands?.push(name);
     } catch (error) {
-      const processedError = handleWindowsPermError(error);
-      (result.errors ??= []).push({ name, error: processedError });
+      result.errors?.push({ name, error: rethrowPermissions(error) });
     }
   }
 
   return result;
 }
 
-/**
- * 链接多个包的可执行文件
- */
 export async function linkPackageBins(
   packages: string[] = [],
 ): Promise<{ results: PkgResult[] }> {
@@ -228,8 +195,10 @@ export async function linkPackageBins(
     try {
       results.push(await linkPackageBin(pkg));
     } catch (error) {
-      const processedError = handleWindowsPermError(error);
-      results.push({ pkg, errors: [{ name: pkg, error: processedError }] });
+      results.push({
+        pkg,
+        errors: [{ name: pkg, error: rethrowPermissions(error) }],
+      });
     }
   }
 
