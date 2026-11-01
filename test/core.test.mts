@@ -12,7 +12,6 @@ const mocks = vi.hoisted(() => ({
   readPackageJson: vi.fn(),
   realpath: vi.fn(),
   resolveDepotDir: vi.fn(),
-  tryLink: vi.fn(),
 }));
 
 vi.mock('../src/fs.mts', () => ({
@@ -24,7 +23,6 @@ vi.mock('../src/fs.mts', () => ({
   localBinDir: '/project/node_modules/.bin',
   projectDir: '/project',
   readPackageJson: mocks.readPackageJson,
-  tryLink: mocks.tryLink,
 }));
 vi.mock('../src/pnpm.mts', () => ({
   findPackageDirs: mocks.findPackageDirs,
@@ -46,6 +44,9 @@ const PROJECT_LINK = path.join('/project', 'node_modules', PKG);
 
 const commandCalls = () =>
   mocks.createSymlink.mock.calls.filter(([link]) => link.startsWith(BIN_DIR));
+/** 补依赖落在 store 里那个包的 node_modules 下，与命令链接分得开 */
+const depCalls = () =>
+  mocks.createSymlink.mock.calls.filter(([link]) => link.startsWith(STORE_DIR));
 
 describe('linkPackageBins', () => {
   beforeEach(() => {
@@ -54,7 +55,6 @@ describe('linkPackageBins', () => {
     mocks.ensureDir.mockResolvedValue(true);
     mocks.readdir.mockResolvedValue([]);
     mocks.createSymlink.mockResolvedValue(undefined);
-    mocks.tryLink.mockResolvedValue(true);
     mocks.realpath.mockImplementation(async (dir: string) => dir);
     mocks.readPackageJson.mockResolvedValue({ bin: { tool: 'tool.js' } });
     mocks.resolveDepotDir.mockResolvedValue(null);
@@ -287,7 +287,6 @@ describe('linkMissingDeps', () => {
     mocks.ensureDir.mockResolvedValue(true);
     mocks.readdir.mockResolvedValue([]);
     mocks.realpath.mockImplementation(async (dir: string) => dir);
-    mocks.tryLink.mockResolvedValue(true);
     mocks.resolveDepotDir.mockResolvedValue(DEPOT_DIR);
   });
 
@@ -300,11 +299,12 @@ describe('linkMissingDeps', () => {
     );
 
     await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(true);
-    expect(mocks.tryLink).toHaveBeenCalledTimes(1);
-    expect(mocks.tryLink).toHaveBeenCalledWith(
-      path.join(STORE_DIR, 'node_modules', 'missing-dep'),
-      [path.join(DEPOT_DIR, 'missing-dep')],
-    );
+    expect(depCalls()).toEqual([
+      [
+        path.join(STORE_DIR, 'node_modules', 'missing-dep'),
+        [path.join(DEPOT_DIR, 'missing-dep')],
+      ],
+    ]);
   });
 
   it('does nothing without a dependency table', async () => {
@@ -318,7 +318,7 @@ describe('linkMissingDeps', () => {
     mocks.readdir.mockRejectedValue(new Error('unreadable'));
 
     await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(false);
-    expect(mocks.tryLink).not.toHaveBeenCalled();
+    expect(mocks.createSymlink).not.toHaveBeenCalled();
   });
 
   it('touches nothing when the package already has every dependency', async () => {
@@ -327,7 +327,7 @@ describe('linkMissingDeps', () => {
 
     await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(false);
     expect(mocks.ensureDir).not.toHaveBeenCalled();
-    expect(mocks.tryLink).not.toHaveBeenCalled();
+    expect(mocks.createSymlink).not.toHaveBeenCalled();
   });
 
   it('gives up when the per-package node_modules cannot be created', async () => {
@@ -337,7 +337,7 @@ describe('linkMissingDeps', () => {
     mocks.ensureDir.mockResolvedValue(false);
 
     await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(false);
-    expect(mocks.tryLink).not.toHaveBeenCalled();
+    expect(mocks.createSymlink).not.toHaveBeenCalled();
   });
 
   it('keeps going when a dependency link fails', async () => {
@@ -345,17 +345,17 @@ describe('linkMissingDeps', () => {
     mocks.readdir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['broken-dep', 'good-dep'] : [],
     );
-    mocks.tryLink.mockResolvedValueOnce(false);
+    mocks.createSymlink.mockRejectedValueOnce(new Error('cross-device'));
 
     await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(true);
-    expect(mocks.tryLink).toHaveBeenCalledTimes(2);
+    expect(depCalls()).toHaveLength(2);
   });
 
   it('reports nothing linked when every dependency fails', async () => {
     mocks.readdir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['broken-dep'] : [],
     );
-    mocks.tryLink.mockResolvedValue(false);
+    mocks.createSymlink.mockRejectedValue(new Error('cross-device'));
 
     await expect(linkMissingDeps(STORE_DIR)).resolves.toBe(false);
   });
@@ -368,9 +368,11 @@ describe('linkMissingDeps', () => {
     );
 
     await linkMissingDeps(STORE_DIR);
-    expect(mocks.tryLink).toHaveBeenCalledWith(
-      path.join(STORE_DIR, 'node_modules', 'missing-dep'),
-      [path.join(DEPOT_DIR, 'missing-dep')],
-    );
+    expect(depCalls()).toEqual([
+      [
+        path.join(STORE_DIR, 'node_modules', 'missing-dep'),
+        [path.join(DEPOT_DIR, 'missing-dep')],
+      ],
+    ]);
   });
 });

@@ -8,7 +8,6 @@ import {
   localBinDir,
   projectDir,
   readPackageJson,
-  tryLink,
   type PackageMeta,
 } from './fs.mts';
 import {
@@ -32,14 +31,13 @@ export type PkgResult = {
   errors?: Array<{ name: string; error: Error }>;
 };
 
-type BinEntries = Array<[name: string, relPath: string]>;
-type Failures = NonNullable<PkgResult['errors']>;
+type Failure = { name: string; error: Error };
 
 /** `bin` 是字符串时命令名取包名（去掉 scope 前缀） */
 function getBinEntries(
   pkg: string,
   bin: NonNullable<PackageMeta['bin']>,
-): BinEntries {
+): Array<[name: string, relPath: string]> {
   return typeof bin === 'string'
     ? [[pkg.split('/').at(-1) as string, bin]]
     : Object.entries(bin);
@@ -52,6 +50,25 @@ function rethrowPermissions(error: unknown): Error {
   }
 
   return error as Error;
+}
+
+/**
+ * 每项各试一次，互不牵连，结果按顺序记成「成了」或「怎么败的」。
+ *
+ * 建命令链接、补依赖都是这个形状：一件事成不成不取决于旁边那件。
+ */
+function attemptEach<T>(
+  items: T[],
+  attempt: (item: T) => Promise<unknown>,
+): Promise<Array<Error | null>> {
+  return Promise.all(
+    items.map((item) =>
+      Promise.resolve(attempt(item)).then(
+        () => null,
+        (error: Error) => error,
+      ),
+    ),
+  );
 }
 
 /**
@@ -91,13 +108,11 @@ export async function linkMissingDeps(pkgDir: string): Promise<boolean> {
 
   // 依赖目录也是 store 里的真实目录，Windows 上与包本体一样建目录链接。
   // 逐个试，别因为一个补不上就放弃其余；有一个补上就算这一趟有收获。
-  const linked = await Promise.all(
-    missing.map((dep) =>
-      tryLink(path.join(depsDir, dep), [path.join(depotDir, dep)]),
-    ),
+  const attempts = await attemptEach(missing, (dep) =>
+    createSymlink(path.join(depsDir, dep), [path.join(depotDir, dep)]),
   );
 
-  return linked.includes(true);
+  return attempts.some((error) => !error);
 }
 
 /**
@@ -107,25 +122,28 @@ export async function linkMissingDeps(pkgDir: string): Promise<boolean> {
  */
 async function linkBinEntries(
   pkgDir: string,
-  binEntries: BinEntries,
-): Promise<{ commands: string[]; errors: Failures }> {
-  const commands: string[] = [];
-  const errors: Failures = [];
+  binEntries: Array<[name: string, relPath: string]>,
+): Promise<{ commands: string[]; errors: Failure[] }> {
+  const attempts = await attemptEach(binEntries, ([name, relPath]) =>
+    createSymlink(path.join(localBinDir, name), [path.join(pkgDir, relPath)]),
+  );
 
-  for (const [name, relPath] of binEntries) {
-    try {
-      await createSymlink(path.join(localBinDir, name), [
-        path.join(pkgDir, relPath),
-      ]);
-      commands.push(name);
-    } catch (error) {
-      // Windows 的 EPERM 靠管理员权限解决，往上冒给 CLI 统一提示；
-      // 其它错误只赔上这一个命令，包与其余命令照常
-      errors.push({ name, error: rethrowPermissions(error) });
-    }
-  }
+  return binEntries.reduce<{ commands: string[]; errors: Failure[] }>(
+    (result, [name], index) => {
+      const error = attempts[index];
 
-  return { commands, errors };
+      if (error) {
+        // Windows 的 EPERM 靠管理员权限解决，往上冒给 CLI 统一提示；
+        // 其它错误只赔上这一个命令，包与其余命令照常
+        result.errors.push({ name, error: rethrowPermissions(error) });
+      } else {
+        result.commands.push(name);
+      }
+
+      return result;
+    },
+    { commands: [], errors: [] },
+  );
 }
 
 /**
@@ -167,9 +185,9 @@ async function linkPackageBin(pkg: string): Promise<PkgResult> {
   }
 
   const [pkgDir, { bin }] = picked;
+  // 没有 bin 的包连本体都不用链：它只提供库，工程里用不着它
   const binEntries = bin ? getBinEntries(pkg, bin) : [];
 
-  // 没有 bin 的包连本体都不用链：它只提供库，工程里用不着它
   if (binEntries.length === 0) {
     return { pkg, noBin: true };
   }
@@ -178,7 +196,8 @@ async function linkPackageBin(pkg: string): Promise<PkgResult> {
   // 候选位置按新到旧一起交给链接：任意一份已到位就不重建，要建就建最新那份。
   await createSymlink(path.join(projectDir, 'node_modules', pkg), pkgDirs);
 
-  // 补依赖与建命令链接互不相干，并行：补依赖要读 store 那张表，动辄几十个 syscall
+  // 补依赖与建命令链接互不相干，并行：补依赖要读 store 那张表，动辄几十个 syscall。
+  // 补依赖是附赠的，补不上不影响已建好的命令链接。
   const [depsLinked, { commands, errors }] = await Promise.all([
     linkMissingDeps(pkgDir).catch(() => false),
     linkBinEntries(pkgDir, binEntries),
@@ -187,7 +206,12 @@ async function linkPackageBin(pkg: string): Promise<PkgResult> {
   return { pkg, commands, errors, depsLinked };
 }
 
-/** 一个包出错只赔上它自己：别让某个包的意外把整次运行炸掉 */
+/**
+ * 一个包出错只赔上它自己：别让某个包的意外把整次运行炸掉。
+ *
+ * Windows 的 EPERM 例外——它靠管理员权限解决，得往上冒给 CLI 统一提示；
+ * 这里只兜住「这个包没链成」，不留住那个错误。
+ */
 async function settle(pkg: string): Promise<PkgResult> {
   try {
     return await linkPackageBin(pkg);

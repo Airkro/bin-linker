@@ -30,7 +30,6 @@ const {
   linkPointsTo,
   localBinDir,
   readPackageJson,
-  tryLink,
 } = await import('../src/fs.mts');
 
 const LINK = '/project/node_modules/.bin/tool';
@@ -196,13 +195,5 @@ describe('filesystem helpers', () => {
     await expect(createSymlink(LINK, [TARGET])).rejects.toThrow(
       'cannot unlink',
     );
-  });
-
-  it('turns link failures into a false result', async () => {
-    // 附赠的那几层只关心「有没有补上」，不往外冒错
-    await expect(tryLink(LINK, [TARGET])).resolves.toBe(true);
-
-    mocks.symlink.mockRejectedValueOnce(new Error('cross-device link'));
-    await expect(tryLink(LINK, [TARGET])).resolves.toBe(false);
   });
 });

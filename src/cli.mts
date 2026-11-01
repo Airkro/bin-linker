@@ -28,28 +28,36 @@ function reportSystemError(error: NodeJS.ErrnoException): number {
   return 1;
 }
 
+/** 一个包落在哪种处境，只可能是一种；按「最该让人去修哪」排 */
+function explain({ pkg, globalBinDir, notFound, noBin }: PkgResult): void {
+  if (globalBinDir) {
+    log.warn(`无法定位 ${fmt.pkg(pkg)} 的全局安装目录`);
+    log.info(`请先把 pnpm 的全局 bin 目录加入 PATH: ${fmt.cmd('pnpm setup')}`);
+  } else if (notFound) {
+    log.warn(`找不到包: ${fmt.pkg(pkg)}`);
+  } else if (noBin) {
+    log.warn(`包 ${fmt.pkg(pkg)} 没有可执行文件`);
+  }
+}
+
 /**
  * 把单个包的结果写进日志，返回链接成功的命令数。
  *
- * 一个包只会落进其中一种处境，按可能性从高到低排；
  * 「补全依赖」是对刚链接的命令的补充，要跟在本包结果后面说，别拖到后面去。
  */
-function report({ pkg, commands = [], errors, ...rest }: PkgResult): number {
-  if (rest.notFound) {
-    log.warn(`找不到包: ${fmt.pkg(pkg)}`);
-  } else if (rest.globalBinDir) {
-    log.warn(`无法定位 ${fmt.pkg(pkg)} 的全局安装目录`);
-    log.info(`请先把 pnpm 的全局 bin 目录加入 PATH: ${fmt.cmd('pnpm setup')}`);
-  } else if (rest.noBin) {
-    log.warn(`包 ${fmt.pkg(pkg)} 没有可执行文件`);
-  } else if (commands.length > 0) {
+function report(result: PkgResult): number {
+  const { pkg, commands = [], errors, depsLinked } = result;
+
+  explain(result);
+
+  if (commands.length > 0) {
     log.info(
       `${fmt.pkg(pkg)}: 已链接 ${fmt.list(commands.map((cmd) => fmt.cmd(cmd)))}`,
     );
 
     // pnpm 全局布局下包够不到自己的间接依赖，这里在包里补了一层 node_modules 指回全局安装根，
     // 说明一下免得让人以为谁改动了 store。只在真有新链接时出现，重跑不会再刷一遍。
-    if (rest.depsLinked) {
+    if (depsLinked) {
       log.info(`已为 ${fmt.pkg(pkg)} 补全依赖链接（来自 pnpm 全局安装根）`);
     }
   }

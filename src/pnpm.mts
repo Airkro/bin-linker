@@ -170,14 +170,12 @@ async function dirsByMtime(dir: string): Promise<string[]> {
   const entries = await Promise.all(
     names.map(async (name) => {
       const child = path.join(dir, name);
+      const mtime = await fs.stat(child).then(
+        (stat) => (stat.isDirectory() ? stat.mtimeMs : -1),
+        () => -1,
+      );
 
-      return {
-        child,
-        mtime: await fs.stat(child).then(
-          (stat) => (stat.isDirectory() ? stat.mtimeMs : -1),
-          () => -1,
-        ),
-      };
+      return { child, mtime };
     }),
   );
 
@@ -238,78 +236,92 @@ export function toPkgName(input: string): string {
 }
 
 /**
- * 一个布局根的 `node_modules` 层。
- *
+ * 一个布局根的 `node_modules` 层：本身就是 node_modules 时原样，否则挂在它下面。
  * `pnpm root -g` 给的常是 `<版本目录>/node_modules`，那种写法也兜住。
  */
 function nodeModulesIn(root: string): string {
-  const base =
-    path.basename(root) === 'node_modules' ? path.dirname(root) : root;
-
-  return path.join(base, 'node_modules');
+  return path.basename(root) === 'node_modules'
+    ? root
+    : path.join(root, 'node_modules');
 }
 
 /**
- * 包可能待的两处固定位置，只此两处、不扫目录：
- * `node_modules/<pkg>`（直接依赖）与 `node_modules/.pnpm/node_modules/<pkg>`
+ * 一个布局根里包可能待的两处固定位置，只此两处、不扫目录：
+ * `node_modules`（直接依赖）与 `node_modules/.pnpm/node_modules`
  * （虚拟布局平铺的「这次安装看得见的全部包」，间接依赖常常只在这里出现）。
  */
-function pkgLocationsIn(root: string): string[] {
+function packageDirsIn(root: string): string[] {
   const nodeModules = nodeModulesIn(root);
 
   return [nodeModules, path.join(nodeModules, '.pnpm', 'node_modules')];
 }
 
+/** 一个布局根的依赖表：`.pnpm/node_modules` 那一层平铺着全部已装包 */
+function depotDirIn(root: string): string {
+  return path.join(nodeModulesIn(root), '.pnpm', 'node_modules');
+}
+
 /**
- * 解析全局包可能的安装位置，顺序即优先级（布局根按新到旧）。
+ * 布局给出的两处线索，按布局根的优先级排好：
+ * 包可能落在哪些目录、以及依赖表在哪。
+ *
+ * 两者是同一份布局的两个答案，一次算完、记一次：早前各自遍历一遍布局根、
+ * 各自拼一遍 `.pnpm/node_modules`，走的是同一条路。
+ */
+export const getLayout = ((): (() => Promise<{
+  layers: string[][];
+  depots: string[];
+}>) => {
+  let cache: Promise<{ layers: string[][]; depots: string[] }> | undefined;
+
+  return () => {
+    cache ??= getLayoutRoots().then((roots) => ({
+      layers: roots.map((root) => packageDirsIn(root)),
+      depots: roots.map((root) => depotDirIn(root)),
+    }));
+
+    return cache;
+  };
+})();
+
+/**
+ * 解析全局包可能的安装位置，顺序即优先级（布局根按新到旧，每根内直接依赖优先）。
  *
  * 返回**全部**候选而不是第一个：同一个包可能同时留在好几个版本目录里，
  * 其中一份的软链可能已经断了。挑哪一份要读了元数据才知道，交给调用方。
  */
 export async function findPackageDirs(pkg: string): Promise<string[]> {
-  const roots = await getLayoutRoots();
+  const { layers } = await getLayout();
   const found = await Promise.all(
-    roots.map((root) =>
-      Promise.all(
-        pkgLocationsIn(root).map((dir) => {
-          const candidate = path.join(dir, pkg);
-
-          return isDirectory(candidate).then((yes) => (yes ? candidate : null));
-        }),
-      ),
-    ),
+    layers.flat().map((dir) => isDirectory(path.join(dir, pkg))),
   );
 
   // 同一个真实目录可能被好几个根认出来，去重且保持「新到旧」的顺序
-  return [...new Set(found.flat().filter((dir): dir is string => !!dir))];
+  return [...new Set(layers.flat().filter((_, index) => found[index]))].map(
+    (dir) => path.join(dir, pkg),
+  );
 }
 
 /**
  * 解析 pnpm 全局安装根里存放「全部已装包」的那一层（`.pnpm/node_modules`）。
  *
  * 真实包在 store 里，包本身够不到这一层，那里平铺着全部依赖。
- * 候选顺序与包定位共用同一份布局根，pnpm 11 的内容寻址目录也一并覆盖。
- * 答案与包无关，每个包都问一遍纯属浪费，记一次就够。
+ * 候选顺序与包定位共用同一份布局，pnpm 11 的内容寻址目录也一并覆盖。
+ * 答案与包无关，每个包都问一遍纯属浪费。
  */
 export const resolveDepotDir = ((): (() => Promise<string | null>) => {
   let cache: Promise<string | null> | undefined;
 
   return () => {
-    cache ??= (async () => {
-      for (const root of await getLayoutRoots()) {
-        const candidate = path.join(
-          nodeModulesIn(root),
-          '.pnpm',
-          'node_modules',
-        );
-
-        if (await isDirectory(candidate)) {
-          return candidate;
+    cache ??= getLayout().then(async ({ depots }) => {
+      for (const dir of depots) {
+        if (await isDirectory(dir)) {
+          return dir;
         }
       }
 
       return null;
-    })();
+    });
 
     return cache;
   };

@@ -26,7 +26,7 @@ export function getLinkType(
 export const projectDir = process.cwd();
 export const localBinDir = path.join(projectDir, 'node_modules', '.bin');
 
-export async function ensureDir(dir: string): Promise<boolean> {
+export function ensureDir(dir: string): Promise<boolean> {
   return fs.mkdir(dir, { recursive: true }).then(
     () => true,
     () => false,
@@ -34,18 +34,16 @@ export async function ensureDir(dir: string): Promise<boolean> {
 }
 
 /** 不存在的链接当它已经删掉了 */
-async function unlinkIfPresent(link: string): Promise<void> {
-  try {
-    await fs.unlink(link);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+function unlinkIfPresent(link: string): Promise<void> {
+  return fs.unlink(link).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') {
       throw error;
     }
-  }
+  });
 }
 
 /** 目标那一侧解析不到就按字面路径比：断掉的 store 链接不该让判定整段失效 */
-async function resolveTargets(targets: string[]): Promise<string[]> {
+function resolveTargets(targets: string[]): Promise<string[]> {
   return Promise.all(
     targets.map((target) => fs.realpath(target).catch(() => target)),
   );
@@ -103,28 +101,13 @@ export async function createSymlink(
   await fs.symlink(targets[0] as string, link, getLinkType(targets[0]));
 }
 
-/**
- * 链不上就把错误吞掉算 false，链上了算 true。
- *
- * 链接本身已经建好的那份（命令、包本体）要把错误往上冒；
- * 附赠的那几层（补依赖）在意的是「有没有补上」，只取这个结果。
- */
-export function tryLink(link: string, targets: string[]): Promise<boolean> {
-  return createSymlink(link, targets).then(
-    () => true,
-    () => false,
-  );
-}
-
 /** package.json 里用得着的那几个字段 */
 export type PackageMeta = {
   bin?: string | Record<string, string>;
 };
 
 /** 读取包的 package.json，读不到或内容无效时返回 null */
-export async function readPackageJson(
-  pkgDir: string,
-): Promise<PackageMeta | null> {
+export function readPackageJson(pkgDir: string): Promise<PackageMeta | null> {
   return fs
     .readFile(path.join(pkgDir, 'package.json'), 'utf8')
     .then((content) => JSON.parse(content) as PackageMeta)
