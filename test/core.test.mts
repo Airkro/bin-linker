@@ -1,13 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import path from 'node:path';
 
+const createRequireMock = vi.hoisted(() => ({ resolve: vi.fn() }));
+
 const mocks = vi.hoisted(() => ({
   createSymlink: vi.fn(),
   ensureDir: vi.fn(),
   isPnpmBinDirMissingFromPath: vi.fn(() => false),
   isWindows: true,
   readPackageJson: vi.fn(),
+  realpath: vi.fn(async (dir: string) => dir),
+  resolveGlobalDepotDir: vi.fn(),
   resolveGlobalPkgDir: vi.fn(),
+  lstat: vi.fn(),
+  readdir: vi.fn(),
   symlink: vi.fn(),
   unlink: vi.fn(),
 }));
@@ -22,10 +28,17 @@ vi.mock('../src/fs.mts', () => ({
   localBinDir: '/project/node_modules/.bin',
   pnpmGlobalPath: '/global/node_modules',
   readPackageJson: mocks.readPackageJson,
+  resolveGlobalDepotDir: mocks.resolveGlobalDepotDir,
   resolveGlobalPkgDir: mocks.resolveGlobalPkgDir,
+}));
+vi.mock('node:module', () => ({
+  createRequire: () => createRequireMock,
 }));
 vi.mock('node:fs', () => ({
   promises: {
+    lstat: mocks.lstat,
+    realpath: mocks.realpath,
+    readdir: mocks.readdir,
     symlink: mocks.symlink,
     unlink: mocks.unlink,
   },
@@ -41,6 +54,12 @@ describe('linkPackageBins', () => {
     mocks.ensureDir.mockResolvedValue(true);
     mocks.unlink.mockRejectedValue({ code: 'ENOENT' });
     mocks.symlink.mockResolvedValue(undefined);
+    mocks.lstat.mockRejectedValue({ code: 'ENOENT' });
+    mocks.readdir.mockResolvedValue([]);
+    mocks.resolveGlobalDepotDir.mockResolvedValue(null);
+    createRequireMock.resolve.mockImplementation((request: string) => {
+      throw new Error(`Cannot find module '${request}'`);
+    });
     mocks.createSymlink.mockResolvedValue(true);
     mocks.resolveGlobalPkgDir.mockImplementation(async (pkg: string) =>
       path.join('/global/node_modules', pkg),
@@ -125,6 +144,55 @@ describe('linkPackageBins', () => {
       path.join('/global/node_modules', '@scope/tool', 'cli.js'),
       path.join('/project/node_modules/.bin', 'tool'),
     );
+  });
+
+  it('links dependencies the package cannot resolve on its own', async () => {
+    // pnpm 全局布局下包的真实路径在 store 里，够不到全局安装根那张依赖表：
+    // 解析不到的依赖要补进真实包的 node_modules，解析得到的不要动
+    mocks.resolveGlobalPkgDir.mockResolvedValue(
+      '/global/store/node_modules/tool',
+    );
+    mocks.realpath.mockResolvedValue('/real/store/node_modules/tool');
+    mocks.resolveGlobalDepotDir.mockResolvedValue('/global/.pnpm/node_modules');
+    mocks.readdir.mockResolvedValue(['missing-dep', 'present-dep']);
+    mocks.readPackageJson.mockResolvedValue({ bin: { tool: 'tool.js' } });
+    createRequireMock.resolve.mockImplementation((request: string) => {
+      if (request === 'present-dep') {
+        return '/real/store/node_modules/tool/node_modules/present-dep';
+      }
+
+      throw new Error(`Cannot find module '${request}'`);
+    });
+
+    const result = await linkPackageBins(['tool']);
+
+    expect(result.results[0]?.depsLinked).toBe(true);
+    expect(mocks.symlink).toHaveBeenCalledWith(
+      '/global/.pnpm/node_modules/missing-dep',
+      path.join('/real/store/node_modules/tool', 'node_modules', 'missing-dep'),
+      'dir',
+    );
+    expect(mocks.symlink).not.toHaveBeenCalledWith(
+      '/global/.pnpm/node_modules/present-dep',
+      expect.anything(),
+      'dir',
+    );
+  });
+
+  it('skips dependency linking when the package has no entry or no depot', async () => {
+    mocks.readPackageJson.mockResolvedValue({ bin: './bin/cli.js' });
+
+    // 没有全局安装根就没有可补的依赖表
+    mocks.resolveGlobalDepotDir.mockResolvedValue(null);
+    await expect(linkPackageBins(['tool'])).resolves.toMatchObject({
+      results: [{ depsLinked: false }],
+    });
+
+    mocks.resolveGlobalDepotDir.mockResolvedValue('/global/.pnpm/node_modules');
+    mocks.readdir.mockRejectedValue(new Error('unreadable'));
+    await expect(linkPackageBins(['tool'])).resolves.toMatchObject({
+      results: [{ depsLinked: false }],
+    });
   });
 
   it('continues after package linking and metadata errors', async () => {

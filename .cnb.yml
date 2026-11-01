@@ -91,19 +91,27 @@ patch:
           script: node ./lib/index.mjs miniprogram-ci
         # miniprogram-ci 没有 -v 参数，`npx --no miniprogram-ci -v` 拿到的是 npx 自身的版本，
         # 这里改为校验链接本身：软链存在、且用 node 执行时走到了它自己的入口。
-        # 只匹配入口抛出的「projectPath should not be empty」这一句，不看退出码——以它那套
-        # 参数校验打头，退出码注定是 1，连同 grep 的管道会把整步判失败（构建 cnb-9i3-1k6bfd4ai）。
+        # 只认「projectPath should not be empty」这一句，不看退出码——以它那套参数校验打头，
+        # 退出码注定是 1，连同 grep 的管道会把整步判失败（构建 cnb-9i3-1k6bfd4ai）。
         # 用 `|| true` 兜住退出码，避免只有 pipefail 的 shell 与没有它的 shell 走出两种结果。
-        # 注意这一步只能证明「入口能起来、参数校验生效」：moment 的 require 在参数校验之后。
+        # 这一步同时看两件事：入口能起来、且 require 得到它的间接依赖。miniprogram-ci 的
+        # 参数校验在 moment 之前，光靠 projectPath 那句只能证明入口起来了——它会在后续
+        # 任何一条 require 链上崩掉（构建 cnb-2rm-1k6bmfhce 就是这么红的），所以
+        # 一旦出现 Cannot find module 直接判失败。
         - name: 验证链接结果
           script: |
             test -L node_modules/.bin/miniprogram-ci
             output=$(node node_modules/.bin/miniprogram-ci 2>&1 || true)
             echo "$output" | head -5
+            if echo "$output" | grep -q 'Cannot find module'; then
+              echo "依赖断了：链接指向的包找不到自己的间接依赖" >&2
+              exit 1
+            fi
             echo "$output" | grep -q 'projectPath should not be empty'
         # 依赖解析是另一回事，单独复现：站在 node_modules 里的软链上解析一次 moment，
         # 不需要 appid 与私钥、也不联网。--depot 会把全局安装根那一层也试一遍，
-        # 分出「祖先链够不到」和「包本身没装全」。
+        # 分出「祖先链够不到」和「包本身没装全」。bin-linker 现在会把够不到的依赖补到包上，
+        # 所以这一步应当解析得到；两个 ✗ 同时出现才是包本身装不全。
         - name: 复现 moment 依赖解析
           script: |
             node fixtures/moment-repro/check-moment.cjs node_modules/miniprogram-ci --depot

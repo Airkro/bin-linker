@@ -44,6 +44,31 @@ export function getPnpmHome(platform = process.platform): string {
 export const pnpmGlobalRoot = path.join(getPnpmHome(), 'global');
 
 /**
+ * pnpm 全局根目录下的版本目录（如 `9`、`v11`）。
+ * 一次全局安装会新建一个，旧的仍在，所以这里按 mtime 从新到旧排。
+ */
+async function getPnpmGlobalVersionDirs(): Promise<string[]> {
+  const entries = (await fs
+    .readdir(pnpmGlobalRoot)
+    .catch(() => [])) as string[];
+  const dirs = await Promise.all(
+    entries.map(async (name) => {
+      const dir = path.join(pnpmGlobalRoot, name);
+
+      return {
+        dir,
+        mtime: await fs
+          .stat(dir)
+          .then((stat) => stat.mtimeMs)
+          .catch(() => 0),
+      };
+    }),
+  );
+
+  return dirs.toSorted((a, b) => b.mtime - a.mtime).map(({ dir }) => dir);
+}
+
+/**
  * corepack 的 shim 会把 stdin 读进内存再转给真实的包管理器
  * （`dist/lib/corepack.cjs` 里等的是 `process.stdin` 的 `end`）。
  * 父进程留着 stdin 不关时，子进程就一直等下去——CI 里就是这么挂满 10 分钟后
@@ -223,13 +248,24 @@ async function isDirectory(dirPath: string): Promise<boolean> {
 }
 
 /**
+ * 依次判断，返回第一个真实存在的目录（软链按其指向算），都没有时返回 undefined。
+ */
+async function firstDirectory(dirs: string[]): Promise<string | undefined> {
+  for (const dir of dirs) {
+    if (await isDirectory(dir)) {
+      return dir;
+    }
+  }
+
+  return undefined;
+}
+
+/**
  * 在单个全局版本根目录中查找包。
  *
- * 兼容 pnpm 10 与 pnpm 11 的不同布局：
- * - pnpm 10：`pnpm root -g` 返回的是 `<root>/<pkg>` 所在的
- *   `<pnpmHome>/global/<ver>/node_modules`，因此包直接位于根目录下；
- *   而遍历版本目录（`<pnpmHome>/global/<ver>`）时，包位于
- *   `<root>/node_modules/<pkg>`。
+ * 兼容 pnpm 10 与 pnpm 11：
+ * - pnpm 10：`pnpm root -g` 返回的 `<pnpmHome>/global/<ver>/node_modules` 下，
+ *   包直接位于根目录；遍历版本目录时包位于 `<root>/node_modules/<pkg>`。
  * - pnpm 11：包位于 `<root>/<virtualDir>/node_modules/<pkg>`
  *   （`virtualDir` 为内容寻址的哈希目录名，不固定）。
  * 依次尝试三种布局，找不到时返回 null。
@@ -238,47 +274,42 @@ async function resolveInVersionDir(
   root: string,
   pkg: string,
 ): Promise<string | null> {
-  // pnpm 10：包直接位于根目录下（root 即 `pnpm root -g` 返回的 node_modules 目录）
-  const direct = path.join(root, pkg);
-  if (await isDirectory(direct)) {
-    return direct;
-  }
+  // 先试两种固定布局，命中就不必去读目录
+  const fixed = await firstDirectory([
+    // pnpm 10：包直接位于根目录下（root 即 `pnpm root -g` 返回的 node_modules）
+    path.join(root, pkg),
+    // pnpm 10：遍历版本目录时，包位于 <root>/node_modules/<pkg>
+    path.join(root, 'node_modules', pkg),
+  ]);
 
-  // pnpm 10：遍历版本目录时，包位于 <root>/node_modules/<pkg>
-  const nodeModules = path.join(root, 'node_modules', pkg);
-  if (await isDirectory(nodeModules)) {
-    return nodeModules;
+  if (fixed) {
+    return fixed;
   }
 
   // pnpm 11：包位于 <root>/<virtualDir>/node_modules/<pkg>
   const entries = await fs.readdir(root).catch(() => []);
-  for (const entry of entries) {
-    const candidate = path.join(root, entry, 'node_modules', pkg);
-    if (await isDirectory(candidate)) {
-      return candidate;
-    }
-  }
 
-  return null;
+  return (
+    (await firstDirectory(
+      entries.map((entry) => path.join(root, entry, 'node_modules', pkg)),
+    )) ?? null
+  );
 }
 
 /**
  * 解析全局包的实际根目录。
  *
  * 当前 pnpm 的 `pnpm root -g` 只返回当前版本的全局根目录
- * （pnpm 10 为 `<pnpmHome>/global/<ver>`，pnpm 11 为
- * `<pnpmHome>/global/v11`）。
+ * （pnpm 10 为 `<pnpmHome>/global/<ver>`，pnpm 11 为 `<pnpmHome>/global/v11`）。
  * 由于 `corepack use` 切换 pnpm 版本时全局目录随之改变，而全局包可能由
  * 其它 pnpm 版本安装（例如 CI 镜像预装的包），因此这里会同时遍历
- * `<pnpmHome>/global` 下所有版本的目录，依次尝试两种布局，
- * 以兼容 pnpm 10 与 pnpm 11，找不到包时返回 null。
+ * `<pnpmHome>/global` 下所有版本的目录，依次尝试各布局，
+ * 找不到包时返回 null。
  */
 export async function resolveGlobalPkgDir(pkg: string): Promise<string | null> {
-  const pnpmGlobalPaths = getPnpmGlobalCandidates();
+  const candidates = getPnpmGlobalCandidates();
 
-  // 优先使用 `pnpm root -g` 的结果（当前 pnpm 版本的全局根目录），
-  // 其次是推断出的版本目录。查找 pnpm 10 / pnpm 11 两种布局，命中即返回。
-  for (const pnpmGlobalPath of pnpmGlobalPaths) {
+  for (const pnpmGlobalPath of candidates) {
     const found = await resolveInVersionDir(pnpmGlobalPath, pkg);
 
     if (found) {
@@ -286,20 +317,16 @@ export async function resolveGlobalPkgDir(pkg: string): Promise<string | null> {
     }
   }
 
-  // `pnpm root -g` 失败或在其目录中未找到时，遍历 <pnpmHome>/global 下
-  // 所有版本子目录（如 `5`、`v11`）自行查找。全局包可能由其它 pnpm 版本
-  // 安装（例如 CI 镜像预装的包），而 `corepack use` 切换 pnpm 版本时
-  // 全局目录随之改变，需要跨版本查找。
-  const versionDirs = await fs.readdir(pnpmGlobalRoot).catch(() => []);
-  for (const entry of versionDirs) {
-    const root = path.join(pnpmGlobalRoot, entry);
+  // 候选目录只有当前版本与按版本号推断的那几个，其余版本目录自己扫
+  const scannedDirs = await getPnpmGlobalVersionDirs();
 
-    if (!pnpmGlobalPaths.includes(root)) {
-      const resolved = await resolveInVersionDir(root, pkg);
+  for (const versionDir of scannedDirs.filter(
+    (dir) => !candidates.includes(dir),
+  )) {
+    const found = await resolveInVersionDir(versionDir, pkg);
 
-      if (resolved) {
-        return resolved;
-      }
+    if (found) {
+      return found;
     }
   }
 
@@ -307,11 +334,41 @@ export async function resolveGlobalPkgDir(pkg: string): Promise<string | null> {
 }
 
 /**
+ * 解析 pnpm 全局安装根里存放「全部已装包」的那一层。
+ *
+ * 全局安装同样走 pnpm 的虚拟布局：真实包在 store 里，
+ * `<pnpmHome>/global/<ver>/node_modules/.pnpm/node_modules` 只有一张软链表，
+ * 平铺着这次安装的全部依赖（含被 hoist 上来的间接依赖）。
+ * 按版本目录从新到旧找第一份存在的。
+ */
+export async function resolveGlobalDepotDir(): Promise<string | null> {
+  const candidates: string[] = [];
+
+  // 版本根下还留着一次安装的结果，但它的 `.pnpm` 里没有依赖表；
+  // 依赖表在内容寻址的子目录里（pnpm 11 每装一次新建一个），所以两层都探。
+  for (const versionDir of await getPnpmGlobalVersionDirs()) {
+    candidates.push(
+      path.join(versionDir, 'node_modules', '.pnpm', 'node_modules'),
+    );
+
+    const entries = await fs.readdir(versionDir).catch((): string[] => []);
+
+    for (const entry of entries) {
+      candidates.push(
+        path.join(versionDir, entry, 'node_modules', '.pnpm', 'node_modules'),
+      );
+    }
+  }
+
+  return (await firstDirectory(candidates)) ?? null;
+}
+
+/**
  * 读取包的package.json文件
  */
 export async function readPackageJson(
   pkg: string,
-): Promise<{ bin?: string | Record<string, string> } | null> {
+): Promise<{ bin?: string | Record<string, string>; main?: string } | null> {
   const pkgDir = await resolveGlobalPkgDir(pkg);
 
   if (!pkgDir) {

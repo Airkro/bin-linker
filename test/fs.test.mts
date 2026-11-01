@@ -37,6 +37,7 @@ const {
   isWindows,
   pnpmGlobalRoot,
   readPackageJson,
+  resolveGlobalDepotDir,
   resolveGlobalPkgDir,
 } = await import('../src/fs.mts');
 
@@ -50,6 +51,8 @@ describe('filesystem helpers', () => {
     mocks.execSync.mockReturnValue('/global/node_modules\n');
     mocks.stat.mockResolvedValue(isDir);
     mocks.readdir.mockResolvedValue([]);
+    // 版本目录（<pnpmHome>/global/<ver>）默认不存在，避免与各用例的布局断言互相干扰
+    mocks.readdir.mockImplementation(async () => []);
   });
 
   it('creates directories and reports creation failures', async () => {
@@ -192,6 +195,46 @@ describe('filesystem helpers', () => {
 
     await expect(resolveGlobalPkgDir('ghost')).resolves.toBeNull();
     expect(mocks.readdir).toHaveBeenCalledWith(GLOBAL_NODE_MODULES);
+  });
+
+  it('finds the dependency table under a content-addressed version dir', async () => {
+    // pnpm 11 每装一次就在版本根下新建一个内容寻址目录，依赖表（.pnpm/node_modules）
+    // 只在那里面；版本根自己的 node_modules 可能根本没有
+    const versionDir = path.join(pnpmGlobalRoot, 'v11');
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      if (dir === pnpmGlobalRoot) {
+        return ['v11'];
+      }
+
+      return dir === versionDir ? ['hash123'] : [];
+    });
+    mocks.stat.mockImplementation(async (dir: string) => {
+      if (
+        dir ===
+        path.join(
+          versionDir,
+          'hash123',
+          'node_modules',
+          '.pnpm',
+          'node_modules',
+        )
+      ) {
+        return isDir;
+      }
+
+      throw new Error('missing');
+    });
+
+    await expect(resolveGlobalDepotDir()).resolves.toBe(
+      path.join(versionDir, 'hash123', 'node_modules', '.pnpm', 'node_modules'),
+    );
+  });
+
+  it('returns null when no version dir exposes a dependency table', async () => {
+    mocks.readdir.mockResolvedValue([]);
+    mocks.stat.mockRejectedValue(new Error('missing'));
+
+    await expect(resolveGlobalDepotDir()).resolves.toBeNull();
   });
 
   it('skips a version entry that resolves to the current global root', async () => {
