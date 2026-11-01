@@ -16,22 +16,20 @@ patch:
           - /home/.share:copy-on-write
       # 不能用 $PATH 拼接：声明在 env 里的 PATH 会先参与变量替换，
       # 此时 $PATH 还是空的，冒号后的内容会被当成命令执行。
+      # npm 全局安装的前缀（/home/.share/npm）只放 node_modules 与 bin，
+      # 不放 PNPM_HOME——两者相同会让 bin/pnpm 自链成环（报 Symbolic link loop）。
       env:
         XDG_DATA_HOME: /home/.share
         PNPM_HOME: /home/.share/pnpm
-        PATH: /home/.share/pnpm/bin:/home/.share/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        NPM_CONFIG_PREFIX: /home/.share/npm
+        PATH: /home/.share/pnpm:/home/.share/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       stages:
-        # pnpm 10 起要求 PNPM_HOME/bin 在 PATH 里才肯执行全局操作，
-        # 而 npm 的全局 bin 落在 /usr/local/bin，所以显式指定 --prefix 后再软链进 PNPM_HOME/bin。
         # 不用 corepack：它没有 packageManager 字段时会去 registry 取 pnpm 最新版，
         # 下载阶段没有任何输出，会撞上 10 分钟无输出超时（构建 cnb-q73-1k6agsf87）。
         - name: 安装 pnpm
           script: |
-            mkdir -p "$PNPM_HOME/bin"
             pnpm_version=$(node -p "require('./package.json').packageManager.split('@')[1]")
-            npm i -g "pnpm@$pnpm_version" --prefix /home/.share/pnpm
-            ln -sf /home/.share/pnpm/bin/pnpm "$PNPM_HOME/bin/pnpm"
-            ln -sf /home/.share/pnpm/bin/pnpx "$PNPM_HOME/bin/pnpx"
+            npm i -g "pnpm@$pnpm_version"
             pnpm -v
         - name: 预热 pnpm
           script: |
