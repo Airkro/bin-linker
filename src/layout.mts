@@ -23,6 +23,7 @@ function layersIn(root: string): [nodeModules: string, depot: string] {
  * 按 mtime 从新到旧排好的子目录，文件与读不到的排掉。
  *
  * 目录可能在被读到的下一瞬就没了（`pnpm` 正在切版本），`stat` 失败一律当作不存在。
+ * 先 stat 再 filter：一次全量 stat 就能把两种结局都定下来，不必再探一遍目录。
  */
 async function dirsByMtime(dir: string): Promise<string[]> {
   const names = await readDir(dir);
@@ -66,33 +67,55 @@ async function findLayoutRoots(): Promise<string[]> {
 /** 布局给出的一份答案：包可能落在哪些目录，以及每个目录对应的依赖表 */
 export type PnpmLayout = {
   /**
-   * 包可能落在的目录，顺序即优先级；每处都带着自己那一层的依赖表。
+   * 包可能落在的目录，顺序即优先级。
    *
    * 依赖表不能全进程只挑一个：全局安装根下常有好几层（每装一次多一个内容寻址目录），
-   * 各层各有一张表。拿 mtime 最新那层的表去补另一层的包，缺的依赖永远算不对——
-   * 那层可能只装了零星几个包（CI 上连着跑上百次构建就是这样），
-   * 于是「缺哪些」算出来是零，包一 require 间接依赖就断。
+   * 各层各有一张表。`pkgDir` 只是「别名表 + 真实包都在」的那一层，真实包可能由另一层补全，
+   * 所以每层都还带着自己的依赖表——补哪个包，就用它自己那层的表。
    */
   layers: { pkgDir: string; depot: string | null }[];
 };
 
 /**
+ * 平铺表是不是一份「别名」：里面的条目都是指向别处的软链。
+ *
+ * pnpm 12 起 `pnpm global add` 会在布局根的 `node_modules` 里铺一张表，条目全部软链回
+ * 内容寻址目录（`global/v11/<id>/node_modules/.pnpm/node_modules`）。它列出的包一个不少，
+ * 但那些软链全都**相对那张表**解析——照着它把依赖链进包的 store 目录里，
+ * 每一条都会落空（`Cannot find module 'moment'` 就是这么来的）。
+ */
+async function isAliasTable(dir: string): Promise<boolean> {
+  const entries = await readDir(dir);
+  const names = entries.filter((name) => !name.startsWith('.'));
+
+  if (names.length === 0) {
+    return false;
+  }
+
+  const links = await Promise.all(
+    names.map((name) =>
+      fs.lstat(path.join(dir, name)).then((stat) => stat.isSymbolicLink()),
+    ),
+  );
+
+  return links.every(Boolean);
+}
+
+/**
  * 某一层里「全部已装包」平铺在哪，返回能找到的全部，顺序即优先级。
  *
  * pnpm 10/11 平铺在 `.pnpm/node_modules`，pnpm 12 起 public hoist 到布局根自己的
- * `node_modules` 顶层，同时**留着一份** `.pnpm/node_modules`：两份都是真的。
- * 所以不能挑一个了事——顶层那份只有直接装的几个包，间接依赖（miniprogram-ci 的 moment）
- * 只在 `.pnpm/node_modules` 里。只认「目录在不在」会挑中空壳，只认第一个非空的则会把
- * 大半张表漏掉。
- *
- * 平铺层常与自己那一层是同一个目录，同一个「目录 + 表」去重留给 readLayout 做。
+ * `node_modules` 顶层，同时**留着一份** `.pnpm/node_modules`：两份都得看。
+ * 顶层那份只有直接装的几个包，间接依赖（miniprogram-ci 的 moment）只在 `.pnpm/node_modules` 里；
+ * 而顶层那份又可能是上面那种别名表，链进去必然落空。表按「能不能直接当链接目标」筛：
+ * 别名表整张跳过，其余照单全收（包不会在两张表里是两份不同的实物，先到先得就够）。
  */
 async function depotsIn([nodeModules, nested]: [string, string]): Promise<
   string[]
 > {
   const found = await Promise.all(
     [nodeModules, nested].map(async (dir) =>
-      (await hasEntries(dir)) ? dir : null,
+      (await hasEntries(dir)) && !(await isAliasTable(dir)) ? dir : null,
     ),
   );
 

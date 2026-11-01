@@ -11,11 +11,16 @@ const mocks = vi.hoisted(() => ({
   ),
   readdir: vi.fn(),
   stat: vi.fn(),
+  lstat: vi.fn(),
 }));
 
 vi.mock('node:child_process', () => ({ execSync: mocks.execSync }));
 vi.mock('node:fs', () => ({
-  promises: { readdir: mocks.readdir, stat: mocks.stat },
+  promises: {
+    readdir: mocks.readdir,
+    stat: mocks.stat,
+    lstat: mocks.lstat,
+  },
 }));
 
 type Layout = typeof import('../src/layout.mts');
@@ -159,6 +164,8 @@ describe('pnpm global layout', () => {
     mocks.execSync.mockClear();
     mocks.stat.mockResolvedValue(isDir);
     mocks.readdir.mockResolvedValue([]);
+    // 平铺表里的条目默认是实物（真目录），别名表才用软链
+    mocks.lstat.mockResolvedValue({ isSymbolicLink: () => false });
     api = await load();
   });
 
@@ -482,6 +489,52 @@ describe('pnpm global layout', () => {
         layerOf(pkgDir, nestedOf(pkgDir)),
       ],
     });
+  });
+
+  it('skips a table whose entries all alias another table', async () => {
+    // pnpm 12 的全局安装根会在 `global/v11/node_modules` 铺一张别名表：条目一个不少，
+    // 但全是软链回内容寻址目录。照着这张表把依赖链进包的 store 目录，每一条都会落空
+    // （`Cannot find module 'moment'` 就是这么来的），所以整张表跳过，只认实物那份
+    const globals = path.join(getPnpmHome(), 'global');
+    const version = path.join(globals, 'v11');
+    const pkgDir = path.join(version, 'node_modules');
+    const real = path.join(version, 'abc123', 'node_modules');
+
+    mocks.execSync.mockReturnValue(`${pkgDir}\n`);
+    mocks.readdir.mockImplementation(async (dir: string) => {
+      if (dir === globals) {
+        return ['v11'];
+      }
+
+      if (dir === version) {
+        return ['abc123'];
+      }
+
+      if (dir === pkgDir) {
+        return ['.bin', 'miniprogram-ci'];
+      }
+
+      return dir === nestedOf(real) ? ['moment'] : [];
+    });
+    mocks.stat.mockReset();
+    fakeFs({
+      [version]: isDirWithMtime(1),
+      [path.join(version, 'abc123')]: isDirWithMtime(2),
+      [pkgDir]: isDirWithMtime(0),
+      [nestedOf(real)]: isDirWithMtime(0),
+      [path.dirname(real)]: isDirWithMtime(0),
+    });
+    // 顶层是别名表（软链），`.pnpm/node_modules` 里才是实物
+    mocks.lstat.mockImplementation(async (entry: string) => ({
+      isSymbolicLink: () => entry.startsWith(pkgDir),
+    }));
+
+    const { layers } = await api.getLayout();
+
+    expect(layers.map(({ depot }) => depot)).not.toContain(pkgDir);
+    expect(layers).toEqual(
+      expect.arrayContaining([layerOf(real, nestedOf(real))]),
+    );
   });
 
   it('skips a dependency table that exists but holds nothing', async () => {
