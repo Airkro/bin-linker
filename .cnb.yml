@@ -98,10 +98,15 @@ patch:
         # 参数校验在 moment 之前，光靠 projectPath 那句只能证明入口起来了——它会在后续
         # 任何一条 require 链上崩掉（构建 cnb-2rm-1k6bmfhce 就是这么红的），所以
         # 一旦出现 Cannot find module 直接判失败。
+        # 但 `node_modules/.bin` 里那个 shim 本身是 pnpm 生成的、以 `#!/usr/bin/env node`
+        # 打头的壳，用 node 去跑它是拿 node 去解析一段 shell（构建 cnb-bf7-1k6d7n2jl 就是这么
+        # 误报的）。要探的是包自己的入口：`bin` 字段指的那个文件。
         - name: 验证链接结果
           script: |
             test -L node_modules/.bin/miniprogram-ci
-            output=$(node node_modules/.bin/miniprogram-ci 2>&1 || true)
+            entry="$(node -p "const p=require('./node_modules/miniprogram-ci/package.json'); p.bin.constructor===Object ? p.bin['miniprogram-ci'] : p.bin")"
+            echo "entry: $entry"
+            output=$(node "node_modules/miniprogram-ci/$entry" 2>&1 || true)
             echo "$output" | head -5
             if echo "$output" | grep -q 'Cannot find module'; then
               echo "依赖断了：链接指向的包找不到自己的间接依赖" >&2

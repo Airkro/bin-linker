@@ -246,12 +246,7 @@ describe('planPackageLinks', () => {
         return ['present-dep', 'top-dep'];
       }
 
-      if (dir === nested) {
-        return ['moment', 'present-dep', 'top-dep'];
-      }
-
-      // 包里那一层指名的两份都在包里了
-      return dir === path.dirname(PKG_DIR) ? ['present-dep', 'top-dep'] : [];
+      return dir === nested ? ['moment', 'present-dep'] : [];
     });
 
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
@@ -262,38 +257,80 @@ describe('planPackageLinks', () => {
           link: path.join(STORE_DIR, 'node_modules', 'top-dep'),
           target: path.join(hoisted, 'top-dep'),
         },
+        {
+          link: path.join(STORE_DIR, 'node_modules', 'moment'),
+          target: path.join(nested, 'moment'),
+        },
       ],
     });
   });
 
-  it('does not link the whole hoisted table into the package', async () => {
-    // 平铺表是全量的，装着别的安装留下的包。补进去的链接只对包自己这一层的
-    // node_modules 有效，照全量补等于给包里塞进上百个与它无关的包
+  it('links the whole hoisted table into the package', async () => {
+    // 平铺表是 pnpm 按这一层的完整依赖图算出来的，一个不少。包里缺的那份往往根本
+    // 不在它自己的 `dependencies` 里（moment 是 moment-timezone 的依赖，
+    // miniprogram-ci 只 require 不声明），逐个去猜永远会漏，所以照单全收
     mocks.getLayout.mockResolvedValue(
       layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
     );
+    mocks.resolvePath.mockResolvedValue(STORE_DIR);
     mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['moment', 'unrelated'] : [],
     );
 
-    await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
-      deps: [],
+    await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toEqual({
+      pkgDir: PKG_DIR,
+      pkgDirs: [PKG_DIR],
+      pkgLink: PROJECT_LINK,
+      binEntries: [['tool', 'tool.js']],
+      deps: ['moment', 'unrelated'].map((dep) => ({
+        link: path.join(STORE_DIR, 'node_modules', dep),
+        target: path.join(DEPOT_DIR, dep),
+      })),
     });
   });
 
-  it('plans nothing to link from a layer that names no dependency', async () => {
-    // `pnpm root -g` 常给出版本目录本身，那一层的 node_modules 只有 `.bin`：
-    // 里面没有指名给这个包的任何依赖，平铺表再多也与它无关
+  it('leaves the dependencies already sitting in the package alone', async () => {
+    // store 里那个包可能本来就带着自己那层 node_modules：已经在了就别重建，
+    // 重建是多余的写操作，还会把别人铺的东西挪走
     mocks.getLayout.mockResolvedValue(
       layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
     );
-    mocks.readDir.mockImplementation(async (dir: string) =>
-      dir === DEPOT_DIR ? ['moment'] : ['.bin'],
-    );
+    mocks.resolvePath.mockResolvedValue(STORE_DIR);
+    mocks.readDir.mockImplementation(async (dir: string) => {
+      if (dir === DEPOT_DIR) {
+        return ['moment', 'own-dep'];
+      }
+
+      return dir === path.join(STORE_DIR, 'node_modules') ? ['own-dep'] : [];
+    });
 
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
-      deps: [],
+      deps: [
+        {
+          link: path.join(STORE_DIR, 'node_modules', 'moment'),
+          target: path.join(DEPOT_DIR, 'moment'),
+        },
+      ],
     });
+  });
+
+  it('does not link the package into its own node_modules', async () => {
+    // 全局安装根的平铺表里也有包自己：链一份自己进去，node 解析会绕回同一个目录
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
+    mocks.resolvePath.mockResolvedValue(STORE_DIR);
+    mocks.readDir.mockImplementation(async (dir: string) =>
+      dir === DEPOT_DIR ? [PKG, 'moment'] : [],
+    );
+
+    const { deps } = (await planPackageLinks(PKG, PROJECT_DIR)) as {
+      deps: { link: string }[];
+    };
+
+    expect(deps.map(({ link }) => link)).toEqual([
+      path.join(STORE_DIR, 'node_modules', 'moment'),
+    ]);
   });
 
   it('falls back to the given directory when the store path cannot be resolved', async () => {
