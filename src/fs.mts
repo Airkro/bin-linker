@@ -197,3 +197,28 @@ export async function createSymlink(
 
   await fs.symlink(target, link, getLinkType(target));
 }
+
+/**
+ * 这个位置上的条目还在不在：`exists` 只说名字占没占住（断链也算），
+ * `alive` 才是「连过去真能拿到东西」。
+ *
+ * 两件事得分开：名字都没占住是「要补」，名字占着而连不过去是「先撤再补」——
+ * 后者光补补不上，`symlink` 对着已存在的条目一律 EEXIST。
+ */
+export async function probePath(
+  link: string,
+): Promise<{ exists: boolean; alive: boolean }> {
+  const [exists, alive] = await Promise.all([
+    fs.lstat(link).then(
+      () => true,
+      () => false,
+    ),
+    // `stat` 会一路跟下去：断了、指向的那份被删了，都算不在
+    fs.stat(link).then(
+      () => true,
+      () => false,
+    ),
+  ]);
+
+  return { exists, alive };
+}

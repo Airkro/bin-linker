@@ -47,6 +47,7 @@ export function queryGlobalRoot(): string | null {
       { encoding: 'utf8', env: queryEnv(), stdio: ['ignore', 'pipe', 'pipe'] },
     );
 
+    // 结果未必在最后一行：pnpm 的 `[WARN]` 走 stdout，可能排在路径后面
     return (
       output
         .split(/\r?\n/)

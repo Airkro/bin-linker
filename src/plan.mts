@@ -2,6 +2,7 @@ import path from 'node:path';
 
 import {
   isPackageEntry,
+  probePath,
   readDir,
   readPackageJson,
   resolvePath,
@@ -24,6 +25,8 @@ export type LinkPlan = {
   binEntries: BinEntry[];
   /** 要补进包里的依赖：链接位置与来源 */
   deps: { link: string; target: string }[];
+  /** 断掉的依赖链接：先撤掉再重建，留着它 `symlink` 一律 EEXIST */
+  stale: string[];
 };
 
 /**
@@ -96,29 +99,39 @@ async function planDeps(
   pkgName: string,
   pkgDir: string,
   depot: string | null,
-): Promise<LinkPlan['deps']> {
+): Promise<{ deps: LinkPlan['deps']; stale: string[] }> {
+  const empty = { deps: [], stale: [] };
+
   if (!depot) {
-    return [];
+    return empty;
   }
 
   // 补在包自己的真实目录里：工程 `node_modules` 里那条链接只是指过去，往链接里写等于改 store
   const realPkgDir = await resolvePath(pkgDir);
   const depsDir = path.join(realPkgDir, 'node_modules');
-  // 包里已经有的那份不动：store 里可能本来就有自己那一层，重建是多余的写操作
-  const [table, present] = await Promise.all([
-    readDir(depot),
-    readDir(depsDir),
-  ]);
-
-  return table
-    .filter(
-      (dep) =>
-        dep !== pkgName && isPackageEntry(dep) && !present.includes(dep),
-    )
+  const table = await readDir(depot);
+  const deps = table
+    .filter((dep) => dep !== pkgName && isPackageEntry(dep))
     .map((dep) => ({
       link: path.join(depsDir, dep),
       target: path.join(depot, dep),
     }));
+
+  // 已在的那份只留真还活着的：链接可能指着上一次安装的版本目录
+  // （`global/v11/<旧哈希>`），pnpm 重装之后那一层连同里面的包一起被删，
+  // 链接就成了断链——名字还在、`readdir` 也看得见，`require` 却一个都解析不到。
+  // 不撤掉它还会一直赖着：`symlink` 对着已存在的条目一律 EEXIST，补依赖直接放弃。
+  const probes = await Promise.all(deps.map(({ link }) => probePath(link)));
+
+  return {
+    // 名字没占住的直接补；占着却连不过去的也在这一份里——先撤再补
+    deps: deps.filter(
+      (_, index) => !probes[index]?.exists || !probes[index]?.alive,
+    ),
+    stale: deps
+      .filter((_, index) => probes[index]?.exists && !probes[index]?.alive)
+      .map(({ link }) => link),
+  };
 }
 
 /**
@@ -137,6 +150,11 @@ function mergeDeps(...plans: LinkPlan['deps'][]): LinkPlan['deps'] {
   }
 
   return [...deps.values()];
+}
+
+/** 把各层的断链并起来，同一个位置只撤一次 */
+function mergeStale(...plans: LinkPlan['stale'][]): string[] {
+  return [...new Set(plans.flat())];
 }
 
 /**
@@ -168,15 +186,16 @@ export async function planPackageLinks(
     return { pkg, pkgDirs, noBin: true };
   }
 
+  const planned = await Promise.all(
+    depots.map((depot) => planDeps(pkg, pkgDir, depot)),
+  );
+
   return {
     pkgDir,
     pkgDirs,
     pkgLink: path.join(projectDir, 'node_modules', pkg),
     binEntries,
-    deps: mergeDeps(
-      ...(await Promise.all(
-        depots.map((depot) => planDeps(pkg, pkgDir, depot)),
-      )),
-    ),
+    deps: mergeDeps(...planned.map(({ deps }) => deps)),
+    stale: mergeStale(...planned.map(({ stale }) => stale)),
   };
 }

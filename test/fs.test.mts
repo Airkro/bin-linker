@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   access: vi.fn(),
+  lstat: vi.fn(),
   mkdir: vi.fn(),
   stat: vi.fn(),
   readFile: vi.fn(),
@@ -15,6 +16,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('node:fs', () => ({
   promises: {
     access: mocks.access,
+    lstat: mocks.lstat,
     mkdir: mocks.mkdir,
     stat: mocks.stat,
     readFile: mocks.readFile,
@@ -31,6 +33,7 @@ const {
   ensureDir,
   hasEntries,
   linkPointsTo,
+  probePath,
   readDir,
   readPackageJson,
   resolvePath,
@@ -339,5 +342,37 @@ describe('filesystem helpers', () => {
     await expect(createSymlink(LINK, [TARGET])).rejects.toThrow(
       'cannot unlink',
     );
+  });
+});
+
+describe('probePath', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it('tells a missing entry from a dangling link', async () => {
+    // 两件事得分得开：名字都没占住是「要补」，名字占着却连不过去是「先撤再补」。
+    // 后者光补补不上——`symlink` 对着已存在的条目一律 EEXIST
+    mocks.lstat.mockRejectedValue(new Error('ENOENT'));
+    mocks.stat.mockRejectedValue(new Error('ENOENT'));
+
+    await expect(probePath(LINK)).resolves.toEqual({
+      exists: false,
+      alive: false,
+    });
+
+    // 断链：lstat 看得见那条链接本身，stat 跟过去是空的
+    mocks.lstat.mockResolvedValue({});
+    await expect(probePath(LINK)).resolves.toEqual({
+      exists: true,
+      alive: false,
+    });
+
+    // 指着的还在
+    mocks.stat.mockResolvedValue({});
+    await expect(probePath(LINK)).resolves.toEqual({
+      exists: true,
+      alive: true,
+    });
   });
 });

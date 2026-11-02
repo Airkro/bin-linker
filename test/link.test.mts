@@ -5,21 +5,26 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   createSymlink: vi.fn(),
   rmdir: vi.fn(),
+  unlink: vi.fn(),
   ensureDir: vi.fn(),
   getLayout: vi.fn(),
   isBinDirMissingFromPath: vi.fn(() => false),
   readDir: vi.fn(),
   readPackageJson: vi.fn(),
   resolvePath: vi.fn(),
+  probePath: vi.fn(),
 }));
 
-vi.mock('node:fs', () => ({ promises: { rmdir: mocks.rmdir } }));
+vi.mock('node:fs', () => ({
+  promises: { rmdir: mocks.rmdir, unlink: mocks.unlink },
+}));
 vi.mock('../src/fs.mts', () => ({
   createSymlink: mocks.createSymlink,
   ensureDir: mocks.ensureDir,
   readDir: mocks.readDir,
   readPackageJson: mocks.readPackageJson,
   resolvePath: mocks.resolvePath,
+  probePath: mocks.probePath,
   // 判据只有一行，跟着真货走；另抄一份，改了真货测试也不会红
   isPackageEntry: (name: string) => !name.startsWith('.'),
   // 只有一处实现，跟着被测代码走，不另立一份。
@@ -71,6 +76,8 @@ describe('planPackageLinks', () => {
     mocks.resolvePath.mockImplementation(async (dir: string) => dir);
     mocks.readPackageJson.mockResolvedValue({ bin: { tool: 'tool.js' } });
     mocks.getLayout.mockResolvedValue(layout());
+    // 默认那份依赖压根不在包里（要补）；已在/断链是特例，由用例自己指名
+    mocks.probePath.mockResolvedValue({ exists: false, alive: false });
   });
 
   it('plans the package link, the commands and the missing dependencies', async () => {
@@ -99,6 +106,7 @@ describe('planPackageLinks', () => {
           target: path.join(DEPOT_DIR, 'missing-dep'),
         },
       ],
+      stale: [],
     });
     expect(mocks.createSymlink).not.toHaveBeenCalled();
   });
@@ -218,9 +226,11 @@ describe('planPackageLinks', () => {
       layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
     );
     mocks.readDir.mockResolvedValue(['linked-dep']);
+    mocks.probePath.mockResolvedValue({ exists: true, alive: true });
 
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
       deps: [],
+      stale: [],
     });
   });
 
@@ -248,6 +258,11 @@ describe('planPackageLinks', () => {
 
       return dir === nested ? ['moment', 'present-dep'] : [];
     });
+    mocks.probePath.mockImplementation(async (link: string) =>
+      path.basename(link) === 'present-dep'
+        ? { exists: true, alive: true }
+        : { exists: false, alive: false },
+    );
 
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
       // 候选只说位置，同一个包目录不重复
@@ -273,9 +288,16 @@ describe('planPackageLinks', () => {
       layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
     );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
+    // 同一个包会被两张表各数一遍（两张表可能指同一层），位置相同只留一份
     mocks.readDir.mockImplementation(async (dir: string) =>
       dir === DEPOT_DIR ? ['moment', 'unrelated'] : [],
     );
+    mocks.getLayout.mockResolvedValue({
+      layers: [
+        { pkgDir: path.dirname(PKG_DIR), depot: DEPOT_DIR },
+        { pkgDir: path.dirname(PKG_DIR), depot: DEPOT_DIR },
+      ],
+    });
 
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toEqual({
       pkgDir: PKG_DIR,
@@ -286,6 +308,7 @@ describe('planPackageLinks', () => {
         link: path.join(STORE_DIR, 'node_modules', dep),
         target: path.join(DEPOT_DIR, dep),
       })),
+      stale: [],
     });
   });
 
@@ -296,13 +319,14 @@ describe('planPackageLinks', () => {
       layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
     );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
-    mocks.readDir.mockImplementation(async (dir: string) => {
-      if (dir === DEPOT_DIR) {
-        return ['moment', 'own-dep'];
-      }
-
-      return dir === path.join(STORE_DIR, 'node_modules') ? ['own-dep'] : [];
-    });
+    mocks.readDir.mockImplementation(async (dir: string) =>
+      dir === DEPOT_DIR ? ['moment', 'own-dep'] : [],
+    );
+    mocks.probePath.mockImplementation(async (link: string) =>
+      path.basename(link) === 'own-dep'
+        ? { exists: true, alive: true }
+        : { exists: false, alive: false },
+    );
 
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
       deps: [
@@ -311,6 +335,44 @@ describe('planPackageLinks', () => {
           target: path.join(DEPOT_DIR, 'moment'),
         },
       ],
+      stale: [],
+    });
+  });
+
+  it('plans to take back the dependency links that point at nothing', async () => {
+    // 链接指着上一次安装的版本目录（`global/v11/<旧哈希>`），pnpm 重装之后那层没了，
+    // 链接成了断链：名字还在、`readdir` 也看得见，`require` 一个都解析不到。
+    // 不撤掉它更糟——`symlink` 对着已存在的条目一律 EEXIST，补依赖永远是空转
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
+    mocks.resolvePath.mockResolvedValue(STORE_DIR);
+    mocks.readDir.mockResolvedValue(['moment']);
+    mocks.probePath.mockResolvedValue({ exists: true, alive: false });
+
+    await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
+      deps: [
+        {
+          link: path.join(STORE_DIR, 'node_modules', 'moment'),
+          target: path.join(DEPOT_DIR, 'moment'),
+        },
+      ],
+      stale: [path.join(STORE_DIR, 'node_modules', 'moment')],
+    });
+  });
+
+  it('plans nothing to do when every dependency link is still alive', async () => {
+    // 重跑是常态：链接都还活着就一个写操作都不该出
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
+    mocks.resolvePath.mockResolvedValue(STORE_DIR);
+    mocks.readDir.mockResolvedValue(['moment']);
+    mocks.probePath.mockResolvedValue({ exists: true, alive: true });
+
+    await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
+      deps: [],
+      stale: [],
     });
   });
 
@@ -368,6 +430,8 @@ describe('linkPackageBins', () => {
     mocks.readPackageJson.mockResolvedValue({ bin: { tool: 'tool.js' } });
     mocks.getLayout.mockResolvedValue(layout());
     mocks.isBinDirMissingFromPath.mockReturnValue(false);
+    mocks.probePath.mockResolvedValue({ exists: false, alive: false });
+    mocks.unlink.mockResolvedValue(undefined);
   });
 
   it('reports missing metadata and binless packages', async () => {
@@ -454,6 +518,11 @@ describe('linkPackageBins', () => {
       // 包里那一层指名了两份，平铺表里都躺着
       return ['missing-dep', 'present-dep'];
     });
+    mocks.probePath.mockImplementation(async (link: string) =>
+      path.basename(link) === 'present-dep'
+        ? { exists: true, alive: true }
+        : { exists: false, alive: false },
+    );
 
     const [result] = await linkPackageBins([PKG]);
 
@@ -467,6 +536,43 @@ describe('linkPackageBins', () => {
         [path.join(DEPOT_DIR, 'missing-dep')],
       ],
     ]);
+  });
+
+  it('takes back the dangling dependency links before linking them again', async () => {
+    // 链接指着上一次安装的版本目录（`global/v11/<旧哈希>`），pnpm 重装之后那层没了：
+    // 名字还占着位，`symlink` 一律 EEXIST，不先撤掉就永远补不上，moment 就是这么断的
+    const stale = path.join(STORE_DIR, 'node_modules', 'moment');
+
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
+    mocks.resolvePath.mockResolvedValue(STORE_DIR);
+    mocks.readDir.mockResolvedValue(['moment']);
+    mocks.probePath.mockResolvedValue({ exists: true, alive: false });
+
+    const [result] = await linkPackageBins([PKG]);
+
+    expect(mocks.unlink).toHaveBeenCalledWith(stale);
+    // 撤完还要照原样补一遍，撤只是为了给新链接腾位置
+    expect(depCalls()).toEqual([[stale, [path.join(DEPOT_DIR, 'moment')]]]);
+    expect(result).toMatchObject({ commands: ['tool'], depsLinked: true });
+  });
+
+  it('keeps the command links when a dangling link cannot be taken back', async () => {
+    // 撤不掉说明有人正在动这棵树：这一条交下去，命令链接已经建好，别整趟赔进去
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
+    mocks.resolvePath.mockResolvedValue(STORE_DIR);
+    mocks.readDir.mockResolvedValue(['moment']);
+    mocks.probePath.mockResolvedValue({ exists: true, alive: false });
+    mocks.unlink.mockRejectedValue(new Error('busy'));
+    mocks.createSymlink.mockResolvedValue(undefined);
+
+    const [result] = await linkPackageBins([PKG]);
+
+    expect(mocks.unlink).toHaveBeenCalled();
+    expect(result).toMatchObject({ commands: ['tool'] });
   });
 
   it('prepares the directories the links land in', async () => {

@@ -62,17 +62,27 @@ async function linkBinEntries(
  * 补不上不算错误：命令链接已经建好，缺哪个依赖交给运行时照实报错。
  */
 async function linkDeps(plan: LinkPlan): Promise<boolean> {
-  if (plan.deps.length === 0) {
+  if (plan.deps.length === 0 && plan.stale.length === 0) {
     return false;
   }
 
+  // 断链先撤：它占着位置，`symlink` 一律 EEXIST，后面再想补就永远补不上。
+  // 撤不掉说明正在有人动这棵树，把这一条交下去照实报错。
+  const removed = await Promise.all(
+    plan.stale.map((link) =>
+      fs.unlink(link).then(
+        () => null,
+        (error: NodeJS.ErrnoException) => error,
+      ),
+    ),
+  );
   // 依赖目录也是 store 里的真实目录，Windows 上与包本体一样建目录链接。
   // 有一个补上就算这一趟有收获，其余交给运行时。
   const attempts = await Promise.all(
     plan.deps.map(({ link, target }) => settle(createSymlink(link, [target]))),
   );
 
-  return attempts.includes(null);
+  return [...removed, ...attempts].includes(null);
 }
 
 /**
