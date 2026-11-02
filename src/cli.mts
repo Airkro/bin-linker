@@ -74,6 +74,13 @@ export async function run(): Promise<number> {
     log.info(`共链接了 ${linkedCount} 个命令`);
   }
 
-  // 全局 bin 目录不在 PATH、包没装，都是得让人去处理的事，不能因为别的包链上了就报成功
-  return outcomes.some((outcome) => isEnvFailure(outcome)) ? 1 : 0;
+  // 全局 bin 目录不在 PATH、包没装，都是得让人去处理的事，不能因为别的包链上了就报成功。
+  // 依赖断着同样不算成功：命令起得来只说明参数校验跑过了，不是这个包能用
+  return outcomes.some(
+    (outcome) =>
+      isEnvFailure(outcome) ||
+      (isLinked(outcome) && (outcome.unresolved?.length ?? 0) > 0),
+  )
+    ? 1
+    : 0;
 }

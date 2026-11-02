@@ -36,10 +36,26 @@ export function report(outcome: Outcome): void {
     : []) {
     log.error(`链接 ${fmt.cmd(name)} 失败: ${error.message}`);
   }
+
+  // 命令链上了、依赖却还断着：这时候退出码再是 0，就是把问题推给运行时。
+  // CI 上那种「绿着红」的构建，就是这么攒出来的
+  const { unresolved = [] } = isLinked(outcome) ? outcome : {};
+
+  if (unresolved.length > 0) {
+    log.error(
+      `${fmt.pkg(outcome.pkg)} 有 ${unresolved.length} 个依赖解析不到: ${fmt.list(
+        unresolved.slice(0, 5),
+      )}${unresolved.length > 5 ? ' …' : ''}`,
+    );
+    log.info(`重装这个包试试: ${fmt.cmd(`pnpm add -g ${outcome.pkg}`)}`);
+  }
 }
 
 /** 把系统错误翻成一句人能读懂的话 */
-export function reportSystemError({ code, message }: NodeJS.ErrnoException): void {
+export function reportSystemError({
+  code,
+  message,
+}: NodeJS.ErrnoException): void {
   switch (code) {
     case 'EPERM': {
       log.error(

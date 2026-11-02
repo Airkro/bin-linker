@@ -152,6 +152,18 @@ describe('cli', () => {
     expect(said(mocks.warn.mock.calls, '找不到包')).toContain('ghost');
   });
 
+  it('fails when the commands are linked but a dependency is still broken', async () => {
+    // 「命令起来了」不等于「包能用」：依赖断着还报成功，等于把问题推给运行时。
+    // CI 上那种绿着红的构建，就是这么攒出来的
+    process.argv = ['node', 'bin-linker', 'tool'];
+
+    await expect(
+      runWith([{ pkg: 'tool', commands: ['tool'], unresolved: ['moment'] }]),
+    ).resolves.toBe(1);
+    expect(said(mocks.error.mock.calls, '依赖解析不到')).toContain('moment');
+    expect(said(mocks.info.mock.calls, 'pnpm add -g tool')).toBeDefined();
+  });
+
   it('does not mention dependency links when nothing was linked', async () => {
     process.argv = ['node', 'bin-linker', 'tool'];
 

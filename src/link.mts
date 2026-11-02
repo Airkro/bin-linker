@@ -2,7 +2,7 @@ import path from 'node:path';
 
 import { promises as fs } from 'node:fs';
 
-import { createSymlink, ensureDir, settle } from './fs.mts';
+import { createSymlink, ensureDir, findUnresolvedDeps, settle } from './fs.mts';
 import { isBinDirMissingFromPath } from './pnpm.mts';
 import { planPackageLinks, type BinEntry, type LinkPlan } from './plan.mts';
 import type { Failure, Outcome, PkgResult } from './result.mts';
@@ -117,6 +117,27 @@ async function dropEmptyDirs(dirs: string[]): Promise<void> {
   }
 }
 
+/**
+ * 补完之后再验一遍：包里那份依赖是不是真够得着。
+ *
+ * 补依赖是照平铺表铺的，铺没铺对没人验过。命令能起来不等于包能用——很多包先做参数校验，
+ * 依赖要等到后面某条 require 才炸。构建里那句「projectPath should not be empty」
+ * 就是这么把断链糊过去的：CI 一路绿灯，用户手里一跑就崩。
+ *
+ * 只在这一次真动过依赖时才查：什么都没动说明上一趟已经铺好，再验一遍等于每次启动
+ * 把几百个依赖重解析一遍。
+ */
+async function verifyDeps(
+  pkgDir: string,
+  declared: string[],
+): Promise<string[]> {
+  if (declared.length === 0) {
+    return [];
+  }
+
+  return findUnresolvedDeps(pkgDir, declared).catch(() => []);
+}
+
 /** 执行一份计划：包本体 → 命令与依赖并行 */
 async function runPlan(pkg: string, plan: LinkPlan): Promise<PkgResult> {
   // 包本体与全部命令都落在工程自己的 node_modules 里。
@@ -132,10 +153,16 @@ async function runPlan(pkg: string, plan: LinkPlan): Promise<PkgResult> {
     linkBinEntries(plan),
   ]);
 
+  // 这一趟没动过依赖，包里那份到底够不够得着就没底了——照清单当场验一遍，
+  // 别把「命令起来了」当成「包能用了」
+  const unresolved = depsLinked
+    ? []
+    : await verifyDeps(plan.pkgDir, plan.declared);
+
   // 一件都没落下就把铺出来的目录撤掉：工程里不该多出空的 node_modules
   await dropEmptyDirs(madeDirs);
 
-  return { pkg, ...linkResult, depsLinked };
+  return { pkg, ...linkResult, depsLinked, unresolved };
 }
 
 async function linkPackageBin(pkg: string): Promise<Outcome> {

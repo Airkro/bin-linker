@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import { builtinModules, createRequire } from 'node:module';
 import path from 'node:path';
 
 /** 读目录，读不到时当作空目录：「不存在」与「没权限」在这里都是「没有」 */
@@ -30,6 +31,8 @@ function resolveLink(target: string): Promise<string> {
 /** package.json 里用得着的那几个字段 */
 export type PackageMeta = {
   bin?: string | Record<string, string>;
+  exports?: unknown;
+  dependencies?: Record<string, string>;
 };
 
 /** 读取包的 package.json，读不到或内容无效时返回 null */
@@ -38,6 +41,129 @@ export function readPackageJson(pkgDir: string): Promise<PackageMeta | null> {
     .readFile(path.join(pkgDir, 'package.json'), 'utf8')
     .then((content) => JSON.parse(content) as PackageMeta)
     .catch(() => null);
+}
+
+/** 这些顶层条目是 `node` 自带的模块，不该去磁盘上找 */
+const builtin = new Set(
+  builtinModules.flatMap((name) => [name, `node:${name}`]),
+);
+
+const isBuiltin = (name: string): boolean => builtin.has(name);
+
+/** `require('a/b')` 里的 `a`：带 scope 的连第一段一起算 */
+function rootOf(name: string): string {
+  const [first = '', second = ''] = name.split('/');
+
+  return first.startsWith('@') ? `${first}/${second}` : first;
+}
+
+/** `exports` 里的一条子路径：`./foo` 这种，能接住 `require('x/foo')` */
+function isSubpath(key: string): boolean {
+  return typeof key === 'string' && key.startsWith('./');
+}
+
+/**
+ * 这份 `package.json` 的 `exports` 是不是一条根入口都没给。
+ *
+ * 这种包的根（`require('x')`）在 node 里必然解析不了：`exports` 给的全是子路径，
+ * 就没有一条能接住包名本身。它本身不说明东西缺了（`@babel/runtime` 就是这么写的，
+ * 用的人只从子路径进），可「找不到」到底是这种正常情况、还是真缺了东西，
+ * 只有这份元数据分得清。
+ */
+function hasNoRootEntry(meta: PackageMeta): boolean {
+  const { exports: entryExports } = meta;
+
+  if (!entryExports || typeof entryExports !== 'object') {
+    return false;
+  }
+
+  const declared = Array.isArray(entryExports)
+    ? entryExports
+    : Object.keys(entryExports);
+
+  return !declared.includes('.') && declared.every((key) => isSubpath(key));
+}
+
+/**
+ * 解析到的东西是不是真在包自己的 `node_modules` 里。
+ *
+ * 两边都解到根再比：这条链上每一层都可能是软链（工程 `node_modules` 里那条指进 store），
+ * 拿字面路径比对的话，屋里那份也会被判成「在外头」。
+ */
+async function isInside(
+  ownDir: string,
+  name: string,
+  found: string,
+): Promise<boolean> {
+  const dir = await resolvePath(path.join(ownDir, name));
+
+  return !path.relative(dir, found).startsWith('..');
+}
+
+/** 解析一个说明符，返回它的真实路径；解析不到给 null */
+function resolveTo(
+  require: NodeRequire,
+  specifier: string,
+): Promise<string | null> {
+  return Promise.resolve()
+    .then(() => require.resolve(specifier))
+    .then(
+      (found) => resolvePath(found),
+      () => null,
+    );
+}
+
+/** 包里那份依赖的元数据，读不到给 null */
+function readMeta(pkgDir: string, name: string): Promise<PackageMeta | null> {
+  return readPackageJson(path.join(pkgDir, 'node_modules', name));
+}
+
+/**
+ * `pkgDir` 这个包跑起来之后，还够不够得着自己的依赖。
+ *
+ * 补依赖是照平铺表整张铺的，表本身对不对没人验过：链接指着上一次安装的版本目录、
+ * 版本目录里的那份被换掉、或者干脆只补了一半——每一种都能让命令照常启动
+ * （参数校验在前），一 require 才炸。构建里看到的「绿」，就是这么来的。
+ *
+ * 只查两件事，都是「包自己声明的依赖」里能当场判死的：
+ * - 根都解析不到的：这份依赖等于不存在；
+ * - 解析到的东西在包自己的 `node_modules` 之外：它只是往上摸到了一份别人的
+ *   （工程自己的 `node_modules` 就在上面），换成另一个工程就又不是这样了。
+ *
+ * 每个依赖再试一条子路径：根解析不到而子路径能解析，是「没给根入口」，不是缺。
+ */
+export async function findUnresolvedDeps(
+  pkgDir: string,
+  names: string[],
+): Promise<string[]> {
+  const entry = path.join(pkgDir, 'index.mjs');
+  const require = createRequire(entry);
+  const ownDir = path.join(pkgDir, 'node_modules');
+
+  const broken = await Promise.all(
+    names
+      .map((name) => rootOf(name))
+      .filter((name) => name && !isBuiltin(name))
+      .map(async (name) => {
+        const tail = name.split('/').at(-1) ?? name;
+        const [found, sub] = await Promise.all([
+          resolveTo(require, name),
+          resolveTo(require, `${name}/${tail}`),
+        ]);
+
+        if (found === null) {
+          const meta = await readMeta(pkgDir, name);
+
+          return sub === null && !(meta && hasNoRootEntry(meta)) ? name : null;
+        }
+
+        const inside = await isInside(ownDir, rootOf(name), found);
+
+        return inside ? null : name;
+      }),
+  );
+
+  return broken.filter((name): name is string => name !== null);
 }
 
 /** 这个条目算不算一个包：点号开头的是 pnpm 自己的元数据（`.bin`、`.modules.yaml`） */

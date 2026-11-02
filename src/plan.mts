@@ -27,6 +27,8 @@ export type LinkPlan = {
   deps: { link: string; target: string }[];
   /** 断掉的依赖链接：先撤掉再重建，留着它 `symlink` 一律 EEXIST */
   stale: string[];
+  /** 包自己声明的依赖名，补完之后照这份清单验一遍 */
+  declared: string[];
 };
 
 /**
@@ -36,6 +38,7 @@ type Picked = {
   pkgDir: string;
   depots: (string | null)[];
   bin?: PackageMeta['bin'];
+  deps?: string[];
 };
 
 /** 一份计划，或者「没装上」的原因——两种结论都从这一个出口给出 */
@@ -60,7 +63,12 @@ async function pickPackage(
         .filter((layer) => layer.pkgDir === dir)
         .map((layer) => layer.depot);
 
-      return { pkgDir, depots, bin: pkgJson.bin };
+      return {
+        pkgDir,
+        depots,
+        bin: pkgJson.bin,
+        deps: Object.keys(pkgJson.dependencies ?? {}),
+      };
     }
   }
 
@@ -178,7 +186,7 @@ export async function planPackageLinks(
     return { pkg, pkgDirs, notFound: true };
   }
 
-  const { pkgDir, depots, bin } = picked;
+  const { pkgDir, depots, bin, deps: declared = [] } = picked;
   const binEntries = bin ? getBinEntries(pkg, bin) : [];
 
   // 没有 bin 的包连本体都不用链：它只提供库，工程里用不着它
@@ -197,5 +205,6 @@ export async function planPackageLinks(
     binEntries,
     deps: mergeDeps(...planned.map(({ deps }) => deps)),
     stale: mergeStale(...planned.map(({ stale }) => stale)),
+    declared,
   };
 }

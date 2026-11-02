@@ -91,16 +91,15 @@ patch:
           script: node ./lib/index.mjs miniprogram-ci
         # miniprogram-ci 没有 -v 参数，`npx --no miniprogram-ci -v` 拿到的是 npx 自身的版本，
         # 这里改为校验链接本身：软链存在、且用 node 执行时走到了它自己的入口。
-        # 只认「projectPath should not be empty」这一句，不看退出码——以它那套参数校验打头，
-        # 退出码注定是 1，连同 grep 的管道会把整步判失败（构建 cnb-9i3-1k6bfd4ai）。
-        # 用 `|| true` 兜住退出码，避免只有 pipefail 的 shell 与没有它的 shell 走出两种结果。
-        # 这一步同时看两件事：入口能起来、且 require 得到它的间接依赖。miniprogram-ci 的
-        # 参数校验在 moment 之前，光靠 projectPath 那句只能证明入口起来了——它会在后续
-        # 任何一条 require 链上崩掉（构建 cnb-2rm-1k6bmfhce 就是这么红的），所以
-        # 一旦出现 Cannot find module 直接判失败。
-        # 但 `node_modules/.bin` 里那个 shim 本身是 pnpm 生成的、以 `#!/usr/bin/env node`
-        # 打头的壳，用 node 去跑它是拿 node 去解析一段 shell（构建 cnb-bf7-1k6d7n2jl 就是这么
-        # 误报的）。要探的是包自己的入口：`bin` 字段指的那个文件。
+        #
+        # 下面这两步都是踩出来的，别再退回「跑一下、看有没有报错」：
+        # 1. `node_modules/.bin` 里那个 shim 是 pnpm 生成的、以 `#!/usr/bin/env node` 打头的壳，
+        #    用 node 去跑它是拿 node 去解析一段 shell（构建 cnb-bf7-1k6d7n2jl 就是这么误报的）。
+        #    要探的是包自己的入口：`bin` 字段指的那个文件。
+        # 2. miniprogram-ci 一上来先做参数校验，退出码注定是 1，而 `projectPath should not be
+        #    empty` 那句在 moment 之前就打出来了。只认这一句，等于只证明「入口起来了」——
+        #    后续任何一条 require 断掉都照样绿（构建 cnb-0dg-1k6dc83na 就是这么绿的）。
+        #    所以依赖是否解析得通，交给 bin-linker 自己的退出码说，别再在这儿复述一遍。
         - name: 验证链接结果
           script: |
             test -L node_modules/.bin/miniprogram-ci
@@ -108,8 +107,19 @@ patch:
             echo "entry: $entry"
             output=$(node "node_modules/miniprogram-ci/$entry" 2>&1 || true)
             echo "$output" | head -5
-            if echo "$output" | grep -q 'Cannot find module'; then
-              echo "依赖断了：链接指向的包找不到自己的间接依赖" >&2
-              exit 1
-            fi
             echo "$output" | grep -q 'projectPath should not be empty'
+        # 上一步只能证明「入口起得来」：miniprogram-ci 的依赖要等到再往后几层 require 才动。
+        # 真正判死的是这一条——`bin-linker` 补完依赖会照包自己声明的 dependencies 当场验一遍，
+        # 有解析不到的就把退出码定成 1。这一条不许 `|| true`，也不许看输出猜。
+        - name: 验证依赖可用
+          script: |
+            node -e 'import("./lib/fs.mjs").then(async ({ findUnresolvedDeps }) => {
+              const { dependencies = {} } = require("./node_modules/miniprogram-ci/package.json");
+              const pkgDir = require("path").resolve("node_modules/miniprogram-ci");
+              const broken = await findUnresolvedDeps(pkgDir, Object.keys(dependencies));
+              if (broken.length > 0) {
+                console.error("解析不到的依赖:", broken.join(", "));
+                process.exit(1);
+              }
+              console.log("依赖全部解析得到:", Object.keys(dependencies).length, "个");
+            })'

@@ -8,6 +8,8 @@ export type PkgResult = {
   commands?: string[];
   /** 本次补上了包自己解析不到的依赖 */
   depsLinked?: boolean;
+  /** 补完之后仍解析不到的依赖：命令起得来，包一 require 就炸 */
+  unresolved?: string[];
   errors?: Failure[];
 };
 

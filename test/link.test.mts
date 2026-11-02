@@ -13,6 +13,9 @@ const mocks = vi.hoisted(() => ({
   readPackageJson: vi.fn(),
   resolvePath: vi.fn(),
   probePath: vi.fn(),
+  findUnresolvedDeps: vi.fn<
+    (dir: string, names: string[]) => Promise<string[]>
+  >(async () => []),
 }));
 
 vi.mock('node:fs', () => ({
@@ -25,6 +28,7 @@ vi.mock('../src/fs.mts', () => ({
   readPackageJson: mocks.readPackageJson,
   resolvePath: mocks.resolvePath,
   probePath: mocks.probePath,
+  findUnresolvedDeps: mocks.findUnresolvedDeps,
   // 判据只有一行，跟着真货走；另抄一份，改了真货测试也不会红
   isPackageEntry: (name: string) => !name.startsWith('.'),
   // 只有一处实现，跟着被测代码走，不另立一份。
@@ -107,6 +111,7 @@ describe('planPackageLinks', () => {
         },
       ],
       stale: [],
+      declared: [],
     });
     expect(mocks.createSymlink).not.toHaveBeenCalled();
   });
@@ -309,6 +314,7 @@ describe('planPackageLinks', () => {
         target: path.join(DEPOT_DIR, dep),
       })),
       stale: [],
+      declared: [],
     });
   });
 
@@ -498,6 +504,7 @@ describe('linkPackageBins', () => {
       pkg: PKG,
       commands: ['first'],
       depsLinked: false,
+      unresolved: [],
       errors: [{ name: 'second', error: new Error('link failed') }],
     });
   });
@@ -648,6 +655,45 @@ describe('linkPackageBins', () => {
     await expect(linkPackageBins([PKG])).resolves.toMatchObject([
       { depsLinked: true, commands: ['tool'] },
     ]);
+  });
+
+  it('checks the declared dependencies when nothing was patched', async () => {
+    // 补依赖没动过手，包里那份到底够不够得着就没底了。命令能起来只说明参数校验跑过了，
+    // 不是这个包能用——照它自己声明的依赖当场验一遍
+    mocks.readPackageJson.mockResolvedValue({
+      bin: { tool: 'tool.js' },
+      dependencies: { moment: '^2' },
+    });
+    mocks.findUnresolvedDeps.mockResolvedValue(['moment']);
+
+    const [result] = await linkPackageBins([PKG]);
+
+    expect(mocks.findUnresolvedDeps).toHaveBeenCalledWith(PKG_DIR, ['moment']);
+    expect(result).toEqual({
+      pkg: PKG,
+      commands: ['tool'],
+      depsLinked: false,
+      unresolved: ['moment'],
+      errors: [],
+    });
+  });
+
+  it('skips the check when the dependencies were just patched', async () => {
+    // 这一趟把依赖铺过了，铺的就是最新的；再验一遍等于每次启动重解析几百个依赖
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
+    mocks.readPackageJson.mockResolvedValue({
+      bin: { tool: 'tool.js' },
+      dependencies: { moment: '^2' },
+    });
+    mocks.resolvePath.mockResolvedValue(STORE_DIR);
+    mocks.readDir.mockResolvedValue(['moment']);
+
+    const [result] = await linkPackageBins([PKG]);
+
+    expect(mocks.findUnresolvedDeps).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ depsLinked: true, unresolved: [] });
   });
 
   it('treats an unreadable dependency table as empty', async () => {

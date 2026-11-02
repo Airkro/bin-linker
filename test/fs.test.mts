@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   access: vi.fn(),
@@ -374,5 +374,94 @@ describe('probePath', () => {
       exists: true,
       alive: true,
     });
+  });
+});
+
+/** 造一棵只认这几条路径的目录树，别的一律解析不到 */
+function fakeTree(files: Record<string, string>) {
+  vi.doMock('node:module', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('node:module')>();
+
+    return {
+      ...actual,
+      createRequire: () => ({
+        resolve: (specifier: string) => {
+          const found = files[specifier];
+
+          if (!found) {
+            throw Object.assign(new Error('MODULE_NOT_FOUND'), {
+              code: 'MODULE_NOT_FOUND',
+            });
+          }
+
+          return found;
+        },
+      }),
+    };
+  });
+}
+
+describe('findUnresolvedDeps', () => {
+  const PKG_DIR = '/root/node_modules/tool';
+  const OWN_DIR = `${PKG_DIR}/node_modules`;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mocks.realpath.mockImplementation(async (target: string) => target);
+    mocks.readFile.mockRejectedValue(new Error('ENOENT'));
+  });
+
+  /** 造一棵树再拿一份新的实现去查：`doMock` 只对之后的 import 生效 */
+  async function resolveWith(files: Record<string, string>, names: string[]) {
+    fakeTree(files);
+    vi.resetModules();
+    const fresh = await import('../src/fs.mts');
+
+    return fresh.findUnresolvedDeps(PKG_DIR, names);
+  }
+
+  afterEach(() => {
+    vi.doUnmock('node:module');
+  });
+
+  it('clears a dependency that really sits in the package', async () => {
+    // pnpm 的链一层套一层，屋里那份解析出来也是 store 里的路径：
+    // 拿字面路径比对，屋里这份会被判成「在外头」，于是永远判红
+    mocks.realpath.mockImplementation(async (target: string) =>
+      target === `${OWN_DIR}/moment` ? '/store/links/moment/2.31.0' : target,
+    );
+
+    await expect(
+      resolveWith({ moment: '/store/links/moment/2.31.0/moment.js' }, [
+        'moment',
+      ]),
+    ).resolves.toEqual([]);
+  });
+
+  it('names the dependencies nobody can resolve', async () => {
+    await expect(resolveWith({}, ['moment', 'node:fs', 'fs'])).resolves.toEqual(
+      ['moment'],
+    );
+  });
+
+  it('lets a dependency without a root entry go when a subpath resolves', async () => {
+    // @babel/runtime 这类包只给了 `exports` 的子路径，`require('@babel/runtime')`
+    // 本来就不成立；它和「东西真缺了」的区别，只有那份 package.json 说得清。
+    // 只认自己那份：别的包有没有 package.json 与这条判据无关
+    mocks.readFile.mockImplementation(async (file: string) =>
+      file === `${OWN_DIR}/@babel/runtime/package.json`
+        ? JSON.stringify({ exports: { './regenerator': './regenerator.js' } })
+        : Promise.reject(new Error('ENOENT')),
+    );
+
+    await expect(
+      resolveWith(
+        {
+          // 子路径试的是包名最后那一段（`runtime`），取到的仍是包里的一条
+          '@babel/runtime/runtime': `${OWN_DIR}/@babel/runtime/regenerator.js`,
+        },
+        ['@babel/runtime'],
+      ),
+    ).resolves.toEqual([]);
   });
 });
