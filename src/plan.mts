@@ -1,6 +1,7 @@
 import path from 'node:path';
 
 import {
+  isPackageEntry,
   readDir,
   readPackageJson,
   resolvePath,
@@ -25,9 +26,15 @@ export type LinkPlan = {
   deps: { link: string; target: string }[];
 };
 
-/** 挑中的那一份包：位置、它自己那几层的依赖表、package.json 里的 bin */
+/**
+ * 挑中的那一份包：位置、它自己那几层的依赖表、package.json 里的 bin。
+ *
+ * `root` 是包所在的那一层（`<内容寻址目录>/node_modules`）。依赖要按这一层去看，
+ * 而不是按补进去的那张平铺表——见 `planDeps`。
+ */
 type Picked = {
   pkgDir: string;
+  root: string;
   depots: (string | null)[];
   bin?: PackageMeta['bin'];
 };
@@ -54,7 +61,7 @@ async function pickPackage(
         .filter((layer) => layer.pkgDir === dir)
         .map((layer) => layer.depot);
 
-      return { pkgDir, depots, bin: pkgJson.bin };
+      return { pkgDir, root: dir, depots, bin: pkgJson.bin };
     }
   }
 
@@ -74,16 +81,22 @@ function getBinEntries(
 /**
  * 包自己解析不到的依赖，返回「缺的那些」以及该从哪里补。
  *
- * pnpm 全局安装把真实包放在 store 里，依赖平铺在全局安装根的 `.pnpm/node_modules`。
+ * pnpm 全局安装把真实包放在 store 里，直接依赖平铺在全局安装根的 `.pnpm/node_modules`。
  * node 按真实路径向上找依赖，从 store 那一层往上够不到全局安装根，包一 require
- * 间接依赖就 MODULE_NOT_FOUND（miniprogram-ci 的 moment 就是这么断的）。
+ * 依赖就 MODULE_NOT_FOUND（miniprogram-ci 的 moment 就是这么断的）。
  * 这里只算出缺哪些，补不补是执行阶段的事。
  *
- * 「缺哪些」只付两次 readdir：依赖表里列出来的就是这一版 pnpm 认为这个包该看得到的
- * 全部依赖，表里有、包里没有，就是缺。
+ * 「该有哪些」按包所在的那一层算（`<内容寻址目录>/node_modules` 里指向 store 的软链），
+ * 不按要补进去的那张平铺表算：表是全量的，装着别的安装留下的包；而补进去的链接
+ * 只对包自己这一层有效，照表补等于把包里没有的全链一遍，多出来的那些会把
+ * 包的 `node_modules` 撑到上百个。
+ *
+ * 换句话说：一个包缺的是「本该跟它装在一起、却被 pnpm 放在公共表里的那几份」，
+ * 而它自己那层恰好就在告诉你哪几份才是它的。
  */
 async function planDeps(
   pkgDir: string,
+  root: string,
   depot: string | null,
 ): Promise<LinkPlan['deps']> {
   if (!depot) {
@@ -93,13 +106,20 @@ async function planDeps(
   // 补在包自己的真实目录里：工程 `node_modules` 里那条链接只是指过去，往链接里写等于改 store
   const realPkgDir = await resolvePath(pkgDir);
   const depsDir = path.join(realPkgDir, 'node_modules');
-  const [table, present] = await Promise.all([
+  // 同一层里指名给这个包的那几份，通常都已经躺平了；
+  // 层里一份都没指名时（`pnpm root -g` 给出版本目录本身）不做补全
+  const [here, table, present] = await Promise.all([
+    readDir(root),
     readDir(depot),
     readDir(depsDir),
   ]);
+  const installed = new Set(table);
 
-  return table
-    .filter((dep) => !present.includes(dep))
+  return here
+    .filter(
+      (dep) =>
+        isPackageEntry(dep) && installed.has(dep) && !present.includes(dep),
+    )
     .map((dep) => ({
       link: path.join(depsDir, dep),
       target: path.join(depot, dep),
@@ -145,7 +165,7 @@ export async function planPackageLinks(
     return { pkg, pkgDirs, notFound: true };
   }
 
-  const { pkgDir, depots, bin } = picked;
+  const { pkgDir, root, depots, bin } = picked;
   const binEntries = bin ? getBinEntries(pkg, bin) : [];
 
   // 没有 bin 的包连本体都不用链：它只提供库，工程里用不着它
@@ -159,7 +179,9 @@ export async function planPackageLinks(
     pkgLink: path.join(projectDir, 'node_modules', pkg),
     binEntries,
     deps: mergeDeps(
-      ...(await Promise.all(depots.map((depot) => planDeps(pkgDir, depot)))),
+      ...(await Promise.all(
+        depots.map((depot) => planDeps(pkgDir, root, depot)),
+      )),
     ),
   };
 }

@@ -20,6 +20,8 @@ vi.mock('../src/fs.mts', () => ({
   readDir: mocks.readDir,
   readPackageJson: mocks.readPackageJson,
   resolvePath: mocks.resolvePath,
+  // 判据只有一行，跟着真货走；另抄一份，改了真货测试也不会红
+  isPackageEntry: (name: string) => !name.startsWith('.'),
   // 只有一处实现，跟着被测代码走，不另立一份。
   // 用真货而不是再 mock 一层：mock 出错时会被当成「链接失败」，测试照样绿
   settle: (task: Promise<unknown>) =>
@@ -73,9 +75,14 @@ describe('planPackageLinks', () => {
 
   it('plans the package link, the commands and the missing dependencies', async () => {
     // 计划只描述「做什么」，出落成计划时磁盘上什么都还没动
-    mocks.readDir.mockImplementation(async (dir: string) =>
-      dir === DEPOT_DIR ? ['missing-dep'] : [],
-    );
+    mocks.readDir.mockImplementation(async (dir: string) => {
+      if (dir === DEPOT_DIR) {
+        return ['missing-dep'];
+      }
+
+      // 包里那一层指名要的那几份：平铺表里放着，包里没有
+      return dir === path.dirname(PKG_DIR) ? ['missing-dep'] : [];
+    });
     mocks.getLayout.mockResolvedValue(
       layout(['/global/node_modules'], [DEPOT_DIR]),
     );
@@ -113,9 +120,13 @@ describe('planPackageLinks', () => {
         ? { bin: { tool: 'tool.js' } }
         : null,
     );
-    mocks.readDir.mockImplementation(async (dir: string) =>
-      dir === pkgDepot ? ['missing-dep'] : [],
-    );
+    mocks.readDir.mockImplementation(async (dir: string) => {
+      if (dir === pkgDepot) {
+        return ['missing-dep'];
+      }
+
+      return dir === '/global/miniprogram' ? ['missing-dep'] : [];
+    });
 
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
       pkgDir: path.join('/global/miniprogram', PKG),
@@ -224,13 +235,23 @@ describe('planPackageLinks', () => {
         { pkgDir: path.dirname(PKG_DIR), depot: nested },
       ],
     });
+    // 包的真实目录在 store 里：`present-dep` 已经躺着了
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
     mocks.readDir.mockImplementation(async (dir: string) => {
+      if (dir === path.join(STORE_DIR, 'node_modules')) {
+        return ['present-dep'];
+      }
+
       if (dir === hoisted) {
         return ['present-dep', 'top-dep'];
       }
 
-      return dir === nested ? ['moment', 'top-dep'] : ['present-dep'];
+      if (dir === nested) {
+        return ['moment', 'present-dep', 'top-dep'];
+      }
+
+      // 包里那一层指名的两份都在包里了
+      return dir === path.dirname(PKG_DIR) ? ['present-dep', 'top-dep'] : [];
     });
 
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
@@ -241,11 +262,37 @@ describe('planPackageLinks', () => {
           link: path.join(STORE_DIR, 'node_modules', 'top-dep'),
           target: path.join(hoisted, 'top-dep'),
         },
-        {
-          link: path.join(STORE_DIR, 'node_modules', 'moment'),
-          target: path.join(nested, 'moment'),
-        },
       ],
+    });
+  });
+
+  it('does not link the whole hoisted table into the package', async () => {
+    // 平铺表是全量的，装着别的安装留下的包。补进去的链接只对包自己这一层的
+    // node_modules 有效，照全量补等于给包里塞进上百个与它无关的包
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
+    mocks.readDir.mockImplementation(async (dir: string) =>
+      dir === DEPOT_DIR ? ['moment', 'unrelated'] : [],
+    );
+
+    await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
+      deps: [],
+    });
+  });
+
+  it('plans nothing to link from a layer that names no dependency', async () => {
+    // `pnpm root -g` 常给出版本目录本身，那一层的 node_modules 只有 `.bin`：
+    // 里面没有指名给这个包的任何依赖，平铺表再多也与它无关
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
+    mocks.readDir.mockImplementation(async (dir: string) =>
+      dir === DEPOT_DIR ? ['moment'] : ['.bin'],
+    );
+
+    await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
+      deps: [],
     });
   });
 
@@ -254,9 +301,13 @@ describe('planPackageLinks', () => {
     mocks.getLayout.mockResolvedValue(
       layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
     );
-    mocks.readDir.mockImplementation(async (dir: string) =>
-      dir === DEPOT_DIR ? ['missing-dep'] : [],
-    );
+    mocks.readDir.mockImplementation(async (dir: string) => {
+      if (dir === DEPOT_DIR) {
+        return ['missing-dep'];
+      }
+
+      return dir === path.dirname(PKG_DIR) ? ['missing-dep'] : [];
+    });
 
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
       deps: [
@@ -357,9 +408,15 @@ describe('linkPackageBins', () => {
       layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
     );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
-    mocks.readDir.mockImplementation(async (dir: string) =>
-      dir === DEPOT_DIR ? ['missing-dep', 'present-dep'] : ['present-dep'],
-    );
+    mocks.readDir.mockImplementation(async (dir: string) => {
+      // 包里已经有 `present-dep`
+      if (dir === path.join(STORE_DIR, 'node_modules')) {
+        return ['present-dep'];
+      }
+
+      // 包里那一层指名了两份，平铺表里都躺着
+      return ['missing-dep', 'present-dep'];
+    });
 
     const [result] = await linkPackageBins([PKG]);
 
@@ -382,9 +439,13 @@ describe('linkPackageBins', () => {
       layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
     );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
-    mocks.readDir.mockImplementation(async (dir: string) =>
-      dir === DEPOT_DIR ? ['missing-dep'] : [],
-    );
+    mocks.readDir.mockImplementation(async (dir: string) => {
+      if (dir === DEPOT_DIR) {
+        return ['missing-dep'];
+      }
+
+      return dir === path.dirname(PKG_DIR) ? ['missing-dep'] : [];
+    });
 
     await linkPackageBins([PKG]);
 
@@ -433,9 +494,13 @@ describe('linkPackageBins', () => {
       layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
     );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
-    mocks.readDir.mockImplementation(async (dir: string) =>
-      dir === DEPOT_DIR ? ['missing-dep'] : [],
-    );
+    mocks.readDir.mockImplementation(async (dir: string) => {
+      if (dir === DEPOT_DIR) {
+        return ['missing-dep'];
+      }
+
+      return dir === path.dirname(PKG_DIR) ? ['missing-dep'] : [];
+    });
 
     await expect(linkPackageBins([PKG])).resolves.toMatchObject([
       { depsLinked: true, commands: ['tool'] },
@@ -460,9 +525,13 @@ describe('linkPackageBins', () => {
       layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
     );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
-    mocks.readDir.mockImplementation(async (dir: string) =>
-      dir === DEPOT_DIR ? ['broken-dep', 'good-dep'] : [],
-    );
+    mocks.readDir.mockImplementation(async (dir: string) => {
+      if (dir === DEPOT_DIR) {
+        return ['broken-dep', 'good-dep'];
+      }
+
+      return dir === path.dirname(PKG_DIR) ? ['broken-dep', 'good-dep'] : [];
+    });
     // 命令链接与存在的那一半依赖都建得成，只有坏的那个依赖链不上
     mocks.createSymlink.mockImplementation(async (link: string) => {
       if (link.endsWith('broken-dep') && link.startsWith(STORE_DIR)) {
@@ -481,9 +550,13 @@ describe('linkPackageBins', () => {
       layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
     );
     mocks.resolvePath.mockResolvedValue(STORE_DIR);
-    mocks.readDir.mockImplementation(async (dir: string) =>
-      dir === DEPOT_DIR ? ['broken-dep'] : [],
-    );
+    mocks.readDir.mockImplementation(async (dir: string) => {
+      if (dir === DEPOT_DIR) {
+        return ['broken-dep'];
+      }
+
+      return dir === path.dirname(PKG_DIR) ? ['broken-dep'] : [];
+    });
     mocks.createSymlink.mockImplementation(async (link: string) => {
       if (link.endsWith('broken-dep') && link.startsWith(STORE_DIR)) {
         throw new Error('cross-device');
