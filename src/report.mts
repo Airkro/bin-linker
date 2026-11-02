@@ -2,11 +2,11 @@ import { fmt, log } from './output.mts';
 import { isLinked, type Outcome } from './result.mts';
 
 /**
- * 播报一个包的结果。
- *
- * 每种处境只说一句，按「最该让人去修哪」排。
- * 「补全依赖」是对刚链接的命令的补充，要跟在本包结果后面说，别拖到后面去。
- */
+播报一个包的结果。
+
+每种处境只说一句，按「最该让人去修哪」排。
+「补全依赖」是对刚链接的命令的补充，要跟在本包结果后面说，别拖到后面去。
+*/
 export function report(outcome: Outcome): void {
   if (isLinked(outcome)) {
     const { pkg, commands = [], depsLinked } = outcome;
@@ -31,9 +31,8 @@ export function report(outcome: Outcome): void {
     log.warn(`找不到包: ${fmt.pkg(outcome.pkg)}`);
   }
 
-  for (const { name, error } of isLinked(outcome)
-    ? (outcome.errors ?? [])
-    : []) {
+  const linkedErrors = isLinked(outcome) ? (outcome.errors ?? []) : [];
+  for (const { name, error } of linkedErrors) {
     log.error(`链接 ${fmt.cmd(name)} 失败: ${error.message}`);
   }
 
@@ -41,17 +40,21 @@ export function report(outcome: Outcome): void {
   // CI 上那种「绿着红」的构建，就是这么攒出来的
   const { unresolved = [] } = isLinked(outcome) ? outcome : {};
 
-  if (unresolved.length > 0) {
-    log.error(
-      `${fmt.pkg(outcome.pkg)} 有 ${unresolved.length} 个依赖解析不到: ${fmt.list(
-        unresolved.slice(0, 5),
-      )}${unresolved.length > 5 ? ' …' : ''}`,
-    );
-    log.info(`重装这个包试试: ${fmt.cmd(`pnpm add -g ${outcome.pkg}`)}`);
+  if (unresolved.length === 0) {
+    return;
   }
+
+  log.error(
+    `${fmt.pkg(outcome.pkg)} 有 ${unresolved.length} 个依赖解析不到: ${fmt.list(
+      unresolved.slice(0, 5),
+    )}${unresolved.length > 5 ? ' …' : ''}`,
+  );
+  log.info(`重装这个包试试: ${fmt.cmd(`pnpm add -g ${outcome.pkg}`)}`);
 }
 
-/** 把系统错误翻成一句人能读懂的话 */
+/**
+把系统错误翻成一句人能读懂的话
+*/
 export function reportSystemError({
   code,
   message,

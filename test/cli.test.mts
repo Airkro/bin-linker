@@ -12,7 +12,7 @@ vi.mock('../src/link.mts', () => ({
 }));
 vi.mock('../src/name.mts', () => ({
   // 名字归一的细节在 name.test 里验，这里只要它把路径尾巴去掉
-  toPkgName: (name: string) => name.replace(/^.*\//, ''),
+  toPkgName: (name: string) => name.replace(/^.*[/\\]/, ''),
 }));
 vi.mock('../src/output.mts', () => ({
   fmt: {
@@ -25,14 +25,18 @@ vi.mock('../src/output.mts', () => ({
 
 const { run } = await import('../src/cli.mts');
 
-/** 用给定结果跑一次 CLI */
+/**
+用给定结果跑一次 CLI
+*/
 async function runWith(results: unknown[]): Promise<number> {
   mocks.linkPackageBins.mockResolvedValue(results);
 
   return run();
 }
 
-/** 播报里提到过某个词的那一次调用 */
+/**
+播报里提到过某个词的那一次调用
+*/
 const said = (calls: unknown[][], word: string) =>
   calls.find(([message]) => String(message).includes(word))?.[0];
 

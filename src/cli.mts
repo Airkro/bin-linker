@@ -7,12 +7,12 @@ import { report, reportSystemError } from './report.mts';
 import { isEnvFailure, isLinked, type Outcome } from './result.mts';
 
 /**
- * argv 里的一个入参 → 包名。
- *
- * 脚本里 `$(pwd)/node_modules/xxx` 这种写法很常见，但 `node_modules` 的实际位置
- * 是按包名拼的，留着绝对路径只会解析不到：工程内的先还原成相对路径（别留一串 `../..`），
- * 再取最后那几段（`@scope` 一起带上）。
- */
+argv 里的一个入参 → 包名。
+
+脚本里 `$(pwd)/node_modules/xxx` 这种写法很常见，但 `node_modules` 的实际位置
+是按包名拼的，留着绝对路径只会解析不到：工程内的先还原成相对路径（别留一串 `../..`），
+再取最后那几段（`@scope` 一起带上）。
+*/
 function readArg(arg: string): string {
   if (!isAbsolute(arg)) {
     return toPkgName(arg);
@@ -23,7 +23,9 @@ function readArg(arg: string): string {
   return toPkgName(rel && !rel.startsWith('..') ? rel : arg);
 }
 
-/** 链接 argv 里的包，把结果写进日志，并给出退出码 */
+/**
+链接 argv 里的包，把结果写进日志，并给出退出码
+*/
 export async function run(): Promise<number> {
   // 先归一成包名再去重：`tool`、`tool`、`$(pwd)/node_modules/tool` 说的是同一个包，
   // 归一之前它们是三个不同的字符串，去重形同虚设（播报两遍、命令数翻倍）

@@ -25,20 +25,24 @@ vi.mock('node:fs', () => ({
 
 type Layout = typeof import('../src/layout.mts');
 
-const isDir = { isDirectory: () => true, mtimeMs: 0 };
-const isFile = { isDirectory: () => false };
-const isDirWithMtime = (mtimeMs: number) => ({
+const dirStat = { isDirectory: () => true, mtimeMs: 0 };
+const fileStat = { isDirectory: () => false };
+const dirStatWithMtime = (mtimeMs: number) => ({
   isDirectory: () => true,
   mtimeMs,
 });
-/** 带「是不是软链」答案的目录，排序要认的那个 */
-const isDirWith = (mtimeMs: number, isLink = false) => ({
+/**
+带「是不是软链」答案的目录，排序要认的那个
+*/
+const dirStatWith = (mtimeMs: number, isLink = false) => ({
   isDirectory: () => true,
   isSymbolicLink: () => isLink,
   mtimeMs,
 });
 
-/** 借一个用例体改环境变量，结束后归还 */
+/**
+借一个用例体改环境变量，结束后归还
+*/
 async function withEnv(
   vars: Record<string, string | undefined>,
   run: () => Promise<void> | void,
@@ -71,7 +75,9 @@ async function withEnv(
   }
 }
 
-/** 用一张「路径 → stat 结果」的表充当文件系统，表外的路径一律不存在 */
+/**
+用一张「路径 → stat 结果」的表充当文件系统，表外的路径一律不存在
+*/
 function fakeFs(
   tree: Record<string, { isDirectory: () => boolean; mtimeMs?: number }>,
 ) {
@@ -87,9 +93,9 @@ function fakeFs(
 }
 
 /**
- * 一个布局根给出的那一层：包落在 `node_modules`（根本身就叫 node_modules 时不再套一层，
- * `pnpm root -g` 给的就是那一层），依赖表默认就在它下面。
- */
+一个布局根给出的那一层：包落在 `node_modules`（根本身就叫 node_modules 时不再套一层，
+`pnpm root -g` 给的就是那一层），依赖表默认就在它下面。
+*/
 const layerOf = (root: string, depot: string | null = null) => {
   const pkgDir =
     path.basename(root) === 'node_modules'
@@ -99,8 +105,14 @@ const layerOf = (root: string, depot: string | null = null) => {
   return { pkgDir, depot };
 };
 
-/** 某一层的 `.pnpm/node_modules` */
+/**
+某一层的 `.pnpm/node_modules`
+*/
 const nestedOf = (pkgDir: string) => path.join(pkgDir, '.pnpm', 'node_modules');
+/**
+平铺表所在的子目录名，用 path.join 拼，跨平台比较才一致
+*/
+const NESTED_SUFFIX = path.join('.pnpm', 'node_modules');
 
 describe('pnpm home', () => {
   beforeEach(() => {
@@ -109,10 +121,10 @@ describe('pnpm home', () => {
 
   it('resolves the pnpm home from the environment', async () => {
     await withEnv({ PNPM_HOME: undefined, XDG_DATA_HOME: '/data' }, () => {
-      expect(getPnpmHome()).toBe('/data/pnpm');
+      expect(getPnpmHome()).toBe(path.join('/data', 'pnpm'));
 
       // 没有 XDG 约定时退回用户目录，各平台同一条式子
-      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+
       delete process.env.XDG_DATA_HOME;
       expect(getPnpmHome()).toBe(
         path.join(os.homedir(), '.local', 'share', 'pnpm'),
@@ -143,7 +155,7 @@ describe('pnpm home', () => {
         expect(isBinDirMissingFromPath()).toBe(false);
 
         // 没有 PATH 时按空串处理
-        // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+
         delete process.env.PATH;
         expect(isBinDirMissingFromPath()).toBe(true);
       },
@@ -156,11 +168,11 @@ describe('pnpm global layout', () => {
   let api: Layout;
 
   /**
-   * 隔离加载一份模块。
-   *
-   * 布局按模块实例记忆化，换一份实例就是从头问一遍；每个用例自己声明一份，
-   * vitest 会按依赖图各自去重。
-   */
+  隔离加载一份模块。
+
+  布局按模块实例记忆化，换一份实例就是从头问一遍；每个用例自己声明一份，
+  vitest 会按依赖图各自去重。
+  */
   const load = (): Promise<Layout> => import('../src/layout.mts');
 
   beforeEach(async () => {
@@ -168,7 +180,7 @@ describe('pnpm global layout', () => {
     vi.resetModules();
     mocks.execSync.mockReturnValue('/global/node_modules\n');
     mocks.execSync.mockClear();
-    mocks.stat.mockResolvedValue(isDir);
+    mocks.stat.mockResolvedValue(dirStat);
     mocks.readdir.mockResolvedValue([]);
     // 平铺表里的条目默认是实物（真目录），别名表才用软链
     mocks.lstat.mockResolvedValue({ isSymbolicLink: () => false });
@@ -193,7 +205,7 @@ describe('pnpm global layout', () => {
         // 依赖表得真有东西，且优先 `node_modules` 与 `.pnpm/node_modules` 里先出现的那个；
         // 两处都有时取 `node_modules`（直接依赖那层）
         mocks.readdir.mockImplementation(async (dir: string) =>
-          dir.endsWith('.pnpm/node_modules') ? ['dep'] : [],
+          dir.endsWith(NESTED_SUFFIX) ? ['dep'] : [],
         );
 
         const pkgDir = '/pnpm-home/global/v11/node_modules';
@@ -216,7 +228,7 @@ describe('pnpm global layout', () => {
         // npm_config_global_bin_dir 与它下面的 bin 一起补进 PATH，原有的条目一个不落
         expect(options.env.PATH?.split(path.delimiter)).toEqual([
           '/elsewhere/bin',
-          '/elsewhere/bin/bin',
+          path.join('/elsewhere/bin', 'bin'),
           '/usr/bin',
           '/pnpm-home/bin',
         ]);
@@ -293,16 +305,12 @@ describe('pnpm global layout', () => {
 
     mocks.execSync.mockReturnValue('');
     mocks.readdir.mockImplementation(async (dir: string) => {
-      if (dir === globals) {
-        return ['v11', '10'];
-      }
-
-      return [];
+      return dir === globals ? ['v11', '10'] : [];
     });
     mocks.stat.mockReset();
     fakeFs({
-      [path.join(globals, 'v11')]: isDirWithMtime(20),
-      [path.join(globals, '10')]: isDirWithMtime(10),
+      [path.join(globals, 'v11')]: dirStatWithMtime(20),
+      [path.join(globals, '10')]: dirStatWithMtime(10),
     });
 
     // 目录名跟版本号没有约定（pnpm 10 是 `10`，pnpm 11 换成 `v11`），新到旧靠 mtime
@@ -347,8 +355,8 @@ describe('pnpm global layout', () => {
     });
     mocks.stat.mockReset();
     fakeFs({
-      [version]: isDirWithMtime(1),
-      [hashed]: isDirWithMtime(2),
+      [version]: dirStatWithMtime(1),
+      [hashed]: dirStatWithMtime(2),
     });
 
     // pnpm 11 把包放在内容寻址的哈希目录下，比版本目录再深一层；
@@ -367,8 +375,8 @@ describe('pnpm global layout', () => {
     );
     mocks.stat.mockReset();
     fakeFs({
-      [path.join(globals, 'v11')]: isDirWithMtime(1),
-      [path.join(globals, 'LICENSE')]: isFile,
+      [path.join(globals, 'v11')]: dirStatWithMtime(1),
+      [path.join(globals, 'LICENSE')]: fileStat,
     });
 
     await expect(api.getLayout()).resolves.toEqual({
@@ -384,7 +392,7 @@ describe('pnpm global layout', () => {
       dir === globals ? ['v11', 'gone'] : [],
     );
     mocks.stat.mockReset();
-    fakeFs({ [path.join(globals, 'v11')]: isDirWithMtime(1) });
+    fakeFs({ [path.join(globals, 'v11')]: dirStatWithMtime(1) });
 
     // pnpm 正在切版本时，读到的目录下一瞬就没了：当作不存在，别把整次探测拖垮
     await expect(api.getLayout()).resolves.toMatchObject({
@@ -423,17 +431,17 @@ describe('pnpm global layout', () => {
         return ['older', 'newer'];
       }
 
-      return dir.endsWith('.pnpm/node_modules') ? ['dep'] : [];
+      return dir.endsWith(NESTED_SUFFIX) ? ['dep'] : [];
     });
     const tree = {
       // 版本目录自身的 node_modules 在这里不存在，只有哈希目录下面那层有依赖表
-      [newer]: isDir,
-      [older]: isDir,
-      [versionDir]: isDirWithMtime(1),
-      [path.dirname(newer)]: isDirWithMtime(20),
-      [path.dirname(older)]: isDirWithMtime(10),
-      [path.join(newer, '.pnpm', 'node_modules')]: isDir,
-      [path.join(older, '.pnpm', 'node_modules')]: isDir,
+      [newer]: dirStat,
+      [older]: dirStat,
+      [versionDir]: dirStatWithMtime(1),
+      [path.dirname(newer)]: dirStatWithMtime(20),
+      [path.dirname(older)]: dirStatWithMtime(10),
+      [path.join(newer, '.pnpm', 'node_modules')]: dirStat,
+      [path.join(older, '.pnpm', 'node_modules')]: dirStat,
     };
 
     // 前面那些用例改动过 stat 的行为，这里得整份换掉
@@ -480,11 +488,11 @@ describe('pnpm global layout', () => {
     // 版本目录自己的 node_modules 两处候选都不存在，两张表都在哈希目录下面那层
     mocks.stat.mockReset();
     fakeFs({
-      [version]: isDirWithMtime(1),
-      [hashed]: isDirWithMtime(2),
-      [pkgDir]: isDirWithMtime(0),
-      [nestedOf(pkgDir)]: isDirWithMtime(0),
-      [path.dirname(pkgDir)]: isDirWithMtime(0),
+      [version]: dirStatWithMtime(1),
+      [hashed]: dirStatWithMtime(2),
+      [pkgDir]: dirStatWithMtime(0),
+      [nestedOf(pkgDir)]: dirStatWithMtime(0),
+      [path.dirname(pkgDir)]: dirStatWithMtime(0),
     });
 
     // 两张表都算数；版本目录自己的 node_modules 是空壳，包探不到那儿去
@@ -524,11 +532,11 @@ describe('pnpm global layout', () => {
     });
     mocks.stat.mockReset();
     fakeFs({
-      [version]: isDirWithMtime(1),
-      [path.join(version, 'abc123')]: isDirWithMtime(2),
-      [pkgDir]: isDirWithMtime(0),
-      [nestedOf(real)]: isDirWithMtime(0),
-      [path.dirname(real)]: isDirWithMtime(0),
+      [version]: dirStatWithMtime(1),
+      [path.join(version, 'abc123')]: dirStatWithMtime(2),
+      [pkgDir]: dirStatWithMtime(0),
+      [nestedOf(real)]: dirStatWithMtime(0),
+      [path.dirname(real)]: dirStatWithMtime(0),
     });
     // 顶层是别名表（软链），`.pnpm/node_modules` 里才是实物
     mocks.lstat.mockImplementation(async (entry: string) => ({
@@ -538,9 +546,8 @@ describe('pnpm global layout', () => {
     const { layers } = await api.getLayout();
 
     expect(layers.map(({ depot }) => depot)).not.toContain(pkgDir);
-    expect(layers).toEqual(
-      expect.arrayContaining([layerOf(real, nestedOf(real))]),
-    );
+    const aliasedLayer = layerOf(real, nestedOf(real));
+    expect(layers).toEqual(expect.arrayContaining([aliasedLayer]));
   });
 
   it('orders version entries by the content, not by the mtime of the link', async () => {
@@ -565,16 +572,16 @@ describe('pnpm global layout', () => {
     let asked = 0;
     mocks.stat.mockImplementation(async (entry: string) => {
       if (entry === version) {
-        return isDirWith(1);
+        return dirStatWith(1);
       }
 
       if (entry === stale) {
-        return isDirWith(20);
+        return dirStatWith(20);
       }
 
       asked += 1;
 
-      return isDirWith(asked === 1 ? 50 : 10, asked === 1);
+      return dirStatWith(asked === 1 ? 50 : 10, asked === 1);
     });
 
     const { layers } = await api.getLayout();
@@ -602,7 +609,7 @@ describe('pnpm global layout', () => {
       return dir === dots ? ['.bin', '.modules.yaml'] : [];
     });
     mocks.stat.mockReset();
-    fakeFs({ [root]: isDirWithMtime(1), [dots]: isDir });
+    fakeFs({ [root]: dirStatWithMtime(1), [dots]: dirStat });
 
     // 整层只有元数据：认得出那里没有表（不该拿它当表去算依赖），
     // 但包还得照旧在那一层里找
@@ -628,7 +635,7 @@ describe('pnpm global layout', () => {
       return dir === table ? ['tool'] : [];
     });
     mocks.stat.mockReset();
-    fakeFs({ [root]: isDirWithMtime(1), [table]: isDir });
+    fakeFs({ [root]: dirStatWithMtime(1), [table]: dirStat });
     mocks.lstat.mockRejectedValue(
       Object.assign(new Error('gone'), { code: 'ENOENT' }),
     );
@@ -654,7 +661,7 @@ describe('pnpm global layout', () => {
       return dir === table ? ['tool'] : [];
     });
     mocks.stat.mockReset();
-    fakeFs({ [root]: isDirWithMtime(1), [table]: isDir });
+    fakeFs({ [root]: dirStatWithMtime(1), [table]: dirStat });
 
     const { layers } = await api.getLayout();
 
@@ -676,7 +683,7 @@ describe('pnpm global layout', () => {
       return dir === table ? ['.bin'] : [];
     });
     mocks.stat.mockReset();
-    fakeFs({ [root]: isDirWithMtime(1), [table]: isDir });
+    fakeFs({ [root]: dirStatWithMtime(1), [table]: dirStat });
     mocks.lstat.mockClear();
 
     const { layers } = await api.getLayout();
@@ -705,7 +712,7 @@ describe('pnpm global layout', () => {
     const asked = new Map<string, number>();
     mocks.stat.mockImplementation(async (entry: string) => {
       if (entry === version) {
-        return isDirWith(1);
+        return dirStatWith(1);
       }
 
       if (entry === broken || entry === toFile) {
@@ -745,7 +752,7 @@ describe('pnpm global layout', () => {
     mocks.readdir.mockImplementation(async (dir: string) =>
       dir === globals ? ['v11'] : [],
     );
-    mocks.stat.mockResolvedValue(isDir);
+    mocks.stat.mockResolvedValue(dirStat);
 
     // 全是空表：宁可没有，也别拿空壳去算「缺哪些依赖」
     await expect(api.getLayout()).resolves.toEqual({

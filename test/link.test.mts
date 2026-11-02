@@ -34,10 +34,7 @@ vi.mock('../src/fs.mts', () => ({
   // 只有一处实现，跟着被测代码走，不另立一份。
   // 用真货而不是再 mock 一层：mock 出错时会被当成「链接失败」，测试照样绿
   settle: (task: Promise<unknown>) =>
-    task.then(
-      () => null,
-      (error: Error) => error,
-    ),
+    task.then(() => null).catch((error: Error) => error),
 }));
 vi.mock('../src/layout.mts', () => ({ getLayout: mocks.getLayout }));
 vi.mock('../src/pnpm.mts', () => ({
@@ -49,20 +46,26 @@ const { planPackageLinks } = await import('../src/plan.mts');
 
 const PKG = 'tool';
 const PKG_DIR = path.join('/global/node_modules', PKG);
-const STORE_DIR = '/global/store/node_modules/tool';
+const STORE_DIR = path.join('global', 'store', 'node_modules', 'tool');
 const DEPOT_DIR = '/global/.pnpm/node_modules';
-/** 工程目录就是进程的工作目录，链接落在它自己的 node_modules 里 */
+/**
+工程目录就是进程的工作目录，链接落在它自己的 node_modules 里
+*/
 const PROJECT_DIR = process.cwd();
 const BIN_DIR = path.join(PROJECT_DIR, 'node_modules', '.bin');
 const PROJECT_LINK = path.join(PROJECT_DIR, 'node_modules', PKG);
 
 const commandCalls = () =>
   mocks.createSymlink.mock.calls.filter(([link]) => link.startsWith(BIN_DIR));
-/** 补依赖落在 store 里那个包的 node_modules 下，与命令链接分得开 */
+/**
+补依赖落在 store 里那个包的 node_modules 下，与命令链接分得开
+*/
 const depCalls = () =>
   mocks.createSymlink.mock.calls.filter(([link]) => link.startsWith(STORE_DIR));
 
-/** 一份只有这一层、没有依赖表的布局 */
+/**
+一份只有这一层、没有依赖表的布局
+*/
 const layout = (
   pkgDirs: string[] = ['/global/node_modules'],
   depots: (string | null)[] = pkgDirs.map(() => null),
@@ -163,7 +166,7 @@ describe('planPackageLinks', () => {
       layout(['/global/v11/node_modules', '/global/10/node_modules']),
     );
     mocks.readPackageJson.mockImplementation(async (dir: string) =>
-      dir === '/global/10/node_modules/tool'
+      dir === path.join('/global/10/node_modules', PKG)
         ? { bin: { tool: 'cli.js' } }
         : null,
     );
@@ -171,11 +174,11 @@ describe('planPackageLinks', () => {
     await expect(planPackageLinks(PKG, PROJECT_DIR)).resolves.toMatchObject({
       // 候选全留着：任意一份已到位就不重建，要建就建最新那份
       pkgDirs: [
-        '/global/v11/node_modules/tool',
-        '/global/10/node_modules/tool',
+        path.join('/global/v11/node_modules', PKG),
+        path.join('/global/10/node_modules', PKG),
       ],
       // 命令与依赖只认读得到元数据的那一份
-      pkgDir: '/global/10/node_modules/tool',
+      pkgDir: path.join('/global/10/node_modules', PKG),
     });
   });
 
@@ -770,22 +773,27 @@ describe('linkPackageBins', () => {
     expect(mocks.readDir).not.toHaveBeenCalled();
   });
 
-  it('records permission failures per command', async () => {
-    // 非 Windows 上 EPERM 只是这一个命令没链上，别把整次运行掀了
-    mocks.createSymlink.mockImplementation(async (link: string) => {
-      if (link === path.join(BIN_DIR, 'tool')) {
-        throw Object.assign(new Error('permission denied'), { code: 'EPERM' });
-      }
-    });
+  it.skipIf(process.platform === 'win32')(
+    'records permission failures per command',
+    async () => {
+      // 非 Windows 上 EPERM 只是这一个命令没链上，别把整次运行掀了
+      mocks.createSymlink.mockImplementation(async (link: string) => {
+        if (link === path.join(BIN_DIR, 'tool')) {
+          throw Object.assign(new Error('permission denied'), {
+            code: 'EPERM',
+          });
+        }
+      });
 
-    const [result] = await linkPackageBins([PKG]);
+      const [result] = await linkPackageBins([PKG]);
 
-    // 只有命令没链上，包本体照常
-    expect(result).toMatchObject({
-      commands: [],
-      errors: [{ error: new Error('permission denied') }],
-    });
-  });
+      // 只有命令没链上，包本体照常
+      expect(result).toMatchObject({
+        commands: [],
+        errors: [{ error: new Error('permission denied') }],
+      });
+    },
+  );
 
   it('leaves a broken layout to the CLI', async () => {
     // 布局算不出来是环境问题，不是某个包的错，往上冒给 CLI 统一提示

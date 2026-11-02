@@ -37,13 +37,13 @@
   },
   "devDependencies": {
     "@bring-it/npm": "^0.9.6",
-    "@nice-move/all-in-base": "^0.8.13",
-    "@vitest/coverage-v8": "^4.1.11",
-    "eslint": "^9.39.5",
-    "garou": "^0.9.21",
-    "prettier": "~3.9.6",
+    "@nice-move/all-in-base": "^0.9.6",
+    "@vitest/coverage-v8": "^5.0.5",
+    "eslint": "^10.14.0",
+    "garou": "^0.9.22",
+    "prettier": "~3.9.10",
     "typescript": "~6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.5"
   },
   "packageManager": "pnpm@12.17.0",
   "engines": {

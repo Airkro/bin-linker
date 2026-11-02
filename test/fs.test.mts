@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -32,7 +34,7 @@ const {
   createSymlink,
   ensureDir,
   hasEntries,
-  linkPointsTo,
+  isLinkPointsTo,
   probePath,
   readDir,
   readPackageJson,
@@ -43,10 +45,22 @@ const {
 const LINK = '/project/node_modules/.bin/tool';
 const TARGET = '/global/node_modules/tool/cli.js';
 
-/** 让 readlink 只对给定路径成功，其余一律当作不是链接 */
+/**
+Windows 建软链必须指明类型：有扩展名的是文件用 `file`，目录用 `junction`
+*/
+const linkType = (target: string): 'file' | 'junction' | undefined =>
+  process.platform === 'win32'
+    ? path.extname(target)
+      ? 'file'
+      : 'junction'
+    : undefined;
+
+/**
+让 readlink 只对给定路径成功，其余一律当作不是链接
+*/
 function readingOnly(points: Record<string, string>) {
   mocks.readlink.mockImplementation(async (link: string) => {
-    if (link in points) {
+    if (Object.hasOwn(points, link)) {
       return points[link];
     }
 
@@ -148,7 +162,7 @@ describe('filesystem helpers', () => {
     await expect(createSymlink(LINK, [TARGET])).resolves.toBeUndefined();
     expect(mocks.unlink).toHaveBeenCalledWith(LINK);
     // 第三个参数是 Windows 的链接类型；非 win32 上给 undefined
-    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, undefined);
+    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, linkType(TARGET));
   });
 
   it('leaves a link that already points at the target', async () => {
@@ -176,7 +190,7 @@ describe('filesystem helpers', () => {
     expect(mocks.symlink).toHaveBeenCalledWith(
       '/global/10/node_modules/tool/cli.js',
       LINK,
-      undefined,
+      linkType('/global/10/node_modules/tool/cli.js'),
     );
   });
 
@@ -197,7 +211,7 @@ describe('filesystem helpers', () => {
     );
 
     await createSymlink(LINK, [shell, real]);
-    expect(mocks.symlink).toHaveBeenCalledWith(real, LINK, undefined);
+    expect(mocks.symlink).toHaveBeenCalledWith(real, LINK, linkType(real));
   });
 
   it('accepts a target that is itself a link', async () => {
@@ -211,7 +225,7 @@ describe('filesystem helpers', () => {
     );
 
     await expect(
-      linkPointsTo('/project/node_modules/tool', [layer]),
+      isLinkPointsTo('/project/node_modules/tool', [layer]),
     ).resolves.toBe(true);
   });
 
@@ -222,7 +236,7 @@ describe('filesystem helpers', () => {
     );
 
     await createSymlink(LINK, [TARGET]);
-    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, undefined);
+    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, linkType(TARGET));
   });
 
   it('fails when none of the targets exist', async () => {
@@ -249,7 +263,7 @@ describe('filesystem helpers', () => {
     });
 
     await createSymlink(LINK, [TARGET]);
-    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, undefined);
+    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, linkType(TARGET));
   });
 
   it('accepts any of the candidate targets', async () => {
@@ -262,7 +276,7 @@ describe('filesystem helpers', () => {
     );
 
     await expect(
-      linkPointsTo('/project/node_modules/tool', [
+      isLinkPointsTo('/project/node_modules/tool', [
         '/global/v11/node_modules/tool',
         '/global/10/node_modules/tool',
       ]),
@@ -277,11 +291,11 @@ describe('filesystem helpers', () => {
       dir === LINK ? '/real/store/old/tool' : '/real/store/tool',
     );
 
-    await expect(linkPointsTo(LINK, [TARGET])).resolves.toBe(false);
+    await expect(isLinkPointsTo(LINK, [TARGET])).resolves.toBe(false);
 
     await createSymlink(LINK, [TARGET]);
     expect(mocks.unlink).toHaveBeenCalledWith(LINK);
-    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, undefined);
+    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, LINK, linkType(TARGET));
   });
 
   it('rebuilds a dangling link whose target is gone too', async () => {
@@ -294,7 +308,7 @@ describe('filesystem helpers', () => {
     readingOnly({ [LINK]: '/global/old/tool' });
     mocks.realpath.mockImplementation(gone);
 
-    await expect(linkPointsTo(LINK, [TARGET])).resolves.toBe(false);
+    await expect(isLinkPointsTo(LINK, [TARGET])).resolves.toBe(false);
     await createSymlink(LINK, [TARGET]);
     expect(gone).toHaveBeenCalled();
     expect(mocks.symlink).toHaveBeenCalled();
@@ -307,7 +321,7 @@ describe('filesystem helpers', () => {
     );
 
     await expect(
-      linkPointsTo('/project/node_modules/tool', [TARGET]),
+      isLinkPointsTo('/project/node_modules/tool', [TARGET]),
     ).resolves.toBe(false);
     await createSymlink(LINK, [TARGET]);
     expect(mocks.symlink).toHaveBeenCalled();
@@ -377,7 +391,9 @@ describe('probePath', () => {
   });
 });
 
-/** 造一棵只认这几条路径的目录树，别的一律解析不到 */
+/**
+造一棵只认这几条路径的目录树，别的一律解析不到
+*/
 function fakeTree(files: Record<string, string>) {
   vi.doMock('node:module', async (importOriginal) => {
     const actual = await importOriginal<typeof import('node:module')>();
@@ -403,7 +419,7 @@ function fakeTree(files: Record<string, string>) {
 
 describe('findUnresolvedDeps', () => {
   const PKG_DIR = '/root/node_modules/tool';
-  const OWN_DIR = `${PKG_DIR}/node_modules`;
+  const OWN_DIR = path.join(PKG_DIR, 'node_modules');
 
   beforeEach(() => {
     vi.resetAllMocks();
@@ -411,7 +427,9 @@ describe('findUnresolvedDeps', () => {
     mocks.readFile.mockRejectedValue(new Error('ENOENT'));
   });
 
-  /** 造一棵树再拿一份新的实现去查：`doMock` 只对之后的 import 生效 */
+  /**
+  造一棵树再拿一份新的实现去查：`doMock` 只对之后的 import 生效
+  */
   async function resolveWith(files: Record<string, string>, names: string[]) {
     fakeTree(files);
     vi.resetModules();
@@ -428,7 +446,9 @@ describe('findUnresolvedDeps', () => {
     // pnpm 的链一层套一层，屋里那份解析出来也是 store 里的路径：
     // 拿字面路径比对，屋里这份会被判成「在外头」，于是永远判红
     mocks.realpath.mockImplementation(async (target: string) =>
-      target === `${OWN_DIR}/moment` ? '/store/links/moment/2.31.0' : target,
+      target === path.join(OWN_DIR, 'moment')
+        ? '/store/links/moment/2.31.0'
+        : target,
     );
 
     await expect(

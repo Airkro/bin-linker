@@ -11,29 +11,45 @@ import {
 import { getLayout, type PnpmLayout } from './layout.mts';
 import type { LocateFailure } from './result.mts';
 
-/** 可执行文件的名字与其在包里的相对位置 */
+/**
+可执行文件的名字与其在包里的相对位置
+*/
 export type BinEntry = [name: string, relPath: string];
 
-/** 一个包要做的全部写操作，出落成这份计划时磁盘上什么都还没动 */
+/**
+一个包要做的全部写操作，出落成这份计划时磁盘上什么都还没动
+*/
 export type LinkPlan = {
-  /** 包本体落在工程 `node_modules` 里的位置 */
+  /**
+  包本体落在工程 `node_modules` 里的位置
+  */
   pkgLink: string;
-  /** 包本体的候选来源，顺序即优先级 */
+  /**
+  包本体的候选来源，顺序即优先级
+  */
   pkgDirs: string[];
-  /** 实际读到元数据的那一份，它的路径才是命令与依赖该用的路径 */
+  /**
+  实际读到元数据的那一份，它的路径才是命令与依赖该用的路径
+  */
   pkgDir: string;
   binEntries: BinEntry[];
-  /** 要补进包里的依赖：链接位置与来源 */
+  /**
+  要补进包里的依赖：链接位置与来源
+  */
   deps: { link: string; target: string }[];
-  /** 断掉的依赖链接：先撤掉再重建，留着它 `symlink` 一律 EEXIST */
+  /**
+  断掉的依赖链接：先撤掉再重建，留着它 `symlink` 一律 EEXIST
+  */
   stale: string[];
-  /** 包自己声明的依赖名，补完之后照这份清单验一遍 */
+  /**
+  包自己声明的依赖名，补完之后照这份清单验一遍
+  */
   declared: string[];
 };
 
 /**
- * 挑中的那一份包：位置、它自己那几层的依赖表、package.json 里的 bin。
- */
+挑中的那一份包：位置、它自己那几层的依赖表、package.json 里的 bin。
+*/
 type Picked = {
   pkgDir: string;
   depots: (string | null)[];
@@ -41,14 +57,16 @@ type Picked = {
   deps?: string[];
 };
 
-/** 一份计划，或者「没装上」的原因——两种结论都从这一个出口给出 */
+/**
+一份计划，或者「没装上」的原因——两种结论都从这一个出口给出
+*/
 export type Planned = LinkPlan | LocateFailure;
 
 /**
- * 从布局的每一层里挑第一个读得到元数据的位置，链断了的那份自动落到下一个。
- *
- * 连同那几层的依赖表一起返回：补依赖得用包自己那层的表，别的层数出来的「缺哪些」不作数。
- */
+从布局的每一层里挑第一个读得到元数据的位置，链断了的那份自动落到下一个。
+
+连同那几层的依赖表一起返回：补依赖得用包自己那层的表，别的层数出来的「缺哪些」不作数。
+*/
 async function pickPackage(
   layers: PnpmLayout['layers'],
   pkg: string,
@@ -75,7 +93,9 @@ async function pickPackage(
   return null;
 }
 
-/** `bin` 是字符串时命令名取包名（去掉 scope 前缀） */
+/**
+`bin` 是字符串时命令名取包名（去掉 scope 前缀）
+*/
 function getBinEntries(
   pkg: string,
   bin: NonNullable<PackageMeta['bin']>,
@@ -86,23 +106,23 @@ function getBinEntries(
 }
 
 /**
- * 包自己解析不到的依赖，返回「缺的那些」以及该从哪里补。
- *
- * pnpm 全局安装把真实包放在 store 里，依赖平铺在内容寻址目录的 `.pnpm/node_modules`。
- * node 按真实路径向上找依赖，从 store 那一层往上够不到全局安装根，包一 require
- * 依赖就 MODULE_NOT_FOUND（miniprogram-ci 的 moment 就是这么断的）。
- * 这里只算出缺哪些，补不补是执行阶段的事。
- *
- * 「该有哪些」既不能只看包自己那一层，也不能只看 `package.json` 里的 `dependencies`：
- * - 只数那一层的条目，间接依赖（moment 压根没在 miniprogram-ci 的 `dependencies` 里出现，
- *   它的 `node_modules` 里也没有）永远算不出来——按包名补一份 moment 就绿过一版，
- *   换一个包又断；
- * - 只认 `dependencies` 同样漏：`moment` 是 `moment-timezone` 的依赖，包只会 require 它。
- *
- * 所以补的是整张平铺表：它是 pnpm 按这一层的完整依赖图算出来的，一个不少，
- * 版本也是 pnpm 自己定的，不会出现两份不同版本抢同一个名字。代价是包里多出几百条链接，
- * 都在 store 里那一个包的目录下，不占工程、不影响别处。
- */
+包自己解析不到的依赖，返回「缺的那些」以及该从哪里补。
+
+pnpm 全局安装把真实包放在 store 里，依赖平铺在内容寻址目录的 `.pnpm/node_modules`。
+node 按真实路径向上找依赖，从 store 那一层往上够不到全局安装根，包一 require
+依赖就 MODULE_NOT_FOUND（miniprogram-ci 的 moment 就是这么断的）。
+这里只算出缺哪些，补不补是执行阶段的事。
+
+「该有哪些」既不能只看包自己那一层，也不能只看 `package.json` 里的 `dependencies`：
+- 只数那一层的条目，间接依赖（moment 压根没在 miniprogram-ci 的 `dependencies` 里出现，
+  它的 `node_modules` 里也没有）永远算不出来——按包名补一份 moment 就绿过一版，
+  换一个包又断；
+- 只认 `dependencies` 同样漏：`moment` 是 `moment-timezone` 的依赖，包只会 require 它。
+
+所以补的是整张平铺表：它是 pnpm 按这一层的完整依赖图算出来的，一个不少，
+版本也是 pnpm 自己定的，不会出现两份不同版本抢同一个名字。代价是包里多出几百条链接，
+都在 store 里那一个包的目录下，不占工程、不影响别处。
+*/
 async function planDeps(
   pkgName: string,
   pkgDir: string,
@@ -143,11 +163,11 @@ async function planDeps(
 }
 
 /**
- * 把各层的补全并起来，同一个依赖只补一次。
- *
- * 平铺层与自己那一层常是同一个目录，同一个包会从两张表里各算出一遍；两处来源也可能
- * 各有一份同名依赖（版本不同），先出现的算数——它来自更靠前的那一层。
- */
+把各层的补全并起来，同一个依赖只补一次。
+
+平铺层与自己那一层常是同一个目录，同一个包会从两张表里各算出一遍；两处来源也可能
+各有一份同名依赖（版本不同），先出现的算数——它来自更靠前的那一层。
+*/
 function mergeDeps(...plans: LinkPlan['deps'][]): LinkPlan['deps'] {
   const deps = new Map<string, LinkPlan['deps'][number]>();
 
@@ -157,19 +177,21 @@ function mergeDeps(...plans: LinkPlan['deps'][]): LinkPlan['deps'] {
     }
   }
 
-  return [...deps.values()];
+  return deps.values().toArray();
 }
 
-/** 把各层的断链并起来，同一个位置只撤一次 */
+/**
+把各层的断链并起来，同一个位置只撤一次
+*/
 function mergeStale(...plans: LinkPlan['stale'][]): string[] {
   return [...new Set(plans.flat())];
 }
 
 /**
- * 算出一个包要做的全部写操作；算不出来就是没装上，返回原因而不抛。
- *
- * `projectDir` 由调用方给：计划只描述「做什么」，不该自己去猜工程在哪。
- */
+算出一个包要做的全部写操作；算不出来就是没装上，返回原因而不抛。
+
+`projectDir` 由调用方给：计划只描述「做什么」，不该自己去猜工程在哪。
+*/
 export async function planPackageLinks(
   pkg: string,
   projectDir: string,
