@@ -192,13 +192,42 @@ describe('planPackageLinks', () => {
     });
   });
 
-  it('reports packages without anything to run', async () => {
+  it('plans the package link when the package has nothing to run', async () => {
+    // 没有 bin 的包按库链：本体那条链接与要补的依赖都照算，只是没有命令
     mocks.readPackageJson.mockResolvedValue({});
 
     await expect(planPackageLinks('library', PROJECT_DIR)).resolves.toEqual({
-      pkg: 'library',
+      pkgDir: path.join('/global/node_modules', 'library'),
       pkgDirs: [path.join('/global/node_modules', 'library')],
-      noBin: true,
+      pkgLink: path.join(PROJECT_DIR, 'node_modules', 'library'),
+      binEntries: [],
+      deps: [],
+      stale: [],
+      declared: [],
+    });
+  });
+
+  it('plans the dependency links for a package with nothing to run', async () => {
+    // 库里也用间接依赖，断链的原因和带 bin 的包一模一样：那张平铺表照铺不误
+    mocks.readPackageJson.mockResolvedValue({});
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
+    mocks.resolvePath.mockResolvedValue(STORE_DIR);
+    mocks.readDir.mockImplementation(async (dir) =>
+      dir === DEPOT_DIR ? ['moment'] : [],
+    );
+
+    await expect(
+      planPackageLinks('library', PROJECT_DIR),
+    ).resolves.toMatchObject({
+      binEntries: [],
+      deps: [
+        {
+          link: path.join(STORE_DIR, 'node_modules', 'moment'),
+          target: path.join(DEPOT_DIR, 'moment'),
+        },
+      ],
     });
   });
 
@@ -443,12 +472,11 @@ describe('linkPackageBins', () => {
     mocks.unlink.mockResolvedValue(undefined);
   });
 
-  it('reports missing metadata and binless packages', async () => {
-    mocks.readPackageJson.mockResolvedValueOnce(null).mockResolvedValueOnce({});
+  it('reports a package with no metadata as not found', async () => {
+    mocks.readPackageJson.mockResolvedValueOnce(null);
 
-    expect(await linkPackageBins(['missing', 'library'])).toMatchObject([
+    expect(await linkPackageBins(['missing'])).toMatchObject([
       { pkg: 'missing', notFound: true },
-      { pkg: 'library', noBin: true },
     ]);
   });
 
@@ -473,19 +501,55 @@ describe('linkPackageBins', () => {
     ]);
   });
 
-  it('does not link a package that has nothing to run', async () => {
-    // 没有 bin 的包连本体都不用链：工程里用不着它
+  it('links a package that has nothing to run', async () => {
+    // 没有 bin 的包按库链进工程：本体这条链接要建，命令一条也没有
+    const libraryDir = path.join('/global/node_modules', 'library');
+    const libraryLink = path.join(PROJECT_DIR, 'node_modules', 'library');
+
     mocks.readPackageJson.mockResolvedValue({});
 
-    await linkPackageBins(['library']);
+    const [result] = await linkPackageBins(['library']);
 
-    expect(mocks.createSymlink).not.toHaveBeenCalled();
+    expect(mocks.createSymlink).toHaveBeenCalledWith(
+      libraryLink,
+      [libraryDir],
+      {
+        replaceDir: true,
+      },
+    );
+    expect(commandCalls()).toEqual([]);
+    expect(result).toMatchObject({ libraryOnly: true, commands: [] });
+  });
+
+  it('patches the dependencies of a package that has nothing to run', async () => {
+    // 库断在间接依赖上跟 CLI 断在同一处：补依赖不该问它有没有命令
+    const storeLibrary = path.join('global', 'store', 'library');
+
+    mocks.readPackageJson.mockResolvedValue({});
+    mocks.getLayout.mockResolvedValue(
+      layout([path.dirname(PKG_DIR)], [DEPOT_DIR]),
+    );
+    mocks.resolvePath.mockResolvedValue(storeLibrary);
+    mocks.readDir.mockImplementation(async (dir) =>
+      dir === DEPOT_DIR ? ['moment'] : [],
+    );
+
+    const [result] = await linkPackageBins(['library']);
+
+    expect(mocks.createSymlink).toHaveBeenCalledWith(
+      path.join(storeLibrary, 'node_modules', 'moment'),
+      [path.join(DEPOT_DIR, 'moment')],
+    );
+    expect(result).toMatchObject({ libraryOnly: true, depsLinked: true });
   });
 
   it('links the package itself and its commands', async () => {
     await linkPackageBins([PKG]);
 
-    expect(mocks.createSymlink).toHaveBeenCalledWith(PROJECT_LINK, [PKG_DIR]);
+    // 只有包本体这一条允许把本地那份换掉；命令与依赖碰不到这种待遇
+    expect(mocks.createSymlink).toHaveBeenCalledWith(PROJECT_LINK, [PKG_DIR], {
+      replaceDir: true,
+    });
     expect(commandCalls()).toEqual([
       [path.join(BIN_DIR, 'tool'), [path.join(PKG_DIR, 'tool.js')]],
     ]);
@@ -506,6 +570,7 @@ describe('linkPackageBins', () => {
     expect(result).toEqual({
       pkg: PKG,
       commands: ['first'],
+      libraryOnly: false,
       depsLinked: false,
       unresolved: [],
       errors: [{ name: 'second', error: new Error('link failed') }],
@@ -675,10 +740,25 @@ describe('linkPackageBins', () => {
     expect(result).toEqual({
       pkg: PKG,
       commands: ['tool'],
+      libraryOnly: false,
       depsLinked: false,
       unresolved: ['moment'],
       errors: [],
     });
+  });
+
+  it('reports nothing broken when the dependency check itself cannot run', async () => {
+    // 查不动不等于查得出问题：这一趟没动过依赖，解析又跑不起来，
+    // 硬报一句「依赖解析不到」只是把人引向一个不存在的断链
+    mocks.readPackageJson.mockResolvedValue({
+      bin: { tool: 'tool.js' },
+      dependencies: { moment: '^2' },
+    });
+    mocks.findUnresolvedDeps.mockRejectedValue(new Error('cannot resolve'));
+
+    const [result] = await linkPackageBins([PKG]);
+
+    expect(result).toMatchObject({ commands: ['tool'], unresolved: [] });
   });
 
   it('skips the check when the dependencies were just patched', async () => {

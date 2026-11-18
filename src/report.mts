@@ -5,28 +5,30 @@ import { isLinked, type Outcome } from './result.mts';
 播报一个包的结果。
 
 每种处境只说一句，按「最该让人去修哪」排。
-「补全依赖」是对刚链接的命令的补充，要跟在本包结果后面说，别拖到后面去。
+「补全依赖」是对刚链上的那个包的补充，要跟在本包结果后面说，别拖到后面去。
 */
 export function report(outcome: Outcome): void {
   if (isLinked(outcome)) {
-    const { pkg, commands = [], depsLinked } = outcome;
+    const { pkg, commands = [], depsLinked, libraryOnly } = outcome;
 
     if (commands.length > 0) {
       log.info(
         `${fmt.pkg(pkg)}: 已链接 ${fmt.list(commands.map((cmd) => fmt.cmd(cmd)))}`,
       );
+    } else if (libraryOnly) {
+      log.info(
+        `${fmt.pkg(pkg)}: 已链入工程的 node_modules（这个包只提供库，没有可执行文件）`,
+      );
+    }
 
-      // pnpm 全局布局下包够不到自己的间接依赖，这里在包里补了一层 node_modules 指回全局安装根，
-      // 说明一下免得让人以为谁改动了 store。只在真有新链接时出现，重跑不会再刷一遍。
-      if (depsLinked) {
-        log.info(`已为 ${fmt.pkg(pkg)} 补全依赖链接（来自 pnpm 全局安装根）`);
-      }
+    // pnpm 全局布局下包够不到自己的间接依赖，这里在包里补了一层 node_modules 指回全局安装根，
+    // 说明一下免得让人以为谁改动了 store。只在真有新链接时出现，重跑不会再刷一遍。
+    if (depsLinked) {
+      log.info(`已为 ${fmt.pkg(pkg)} 补全依赖链接（来自 pnpm 全局安装根）`);
     }
   } else if (outcome.globalBinDir) {
     log.warn(`无法定位 ${fmt.pkg(outcome.pkg)} 的全局安装目录`);
     log.info(`请先把 pnpm 的全局 bin 目录加入 PATH: ${fmt.cmd('pnpm setup')}`);
-  } else if (outcome.noBin) {
-    log.warn(`包 ${fmt.pkg(outcome.pkg)} 没有可执行文件`);
   } else {
     log.warn(`找不到包: ${fmt.pkg(outcome.pkg)}`);
   }

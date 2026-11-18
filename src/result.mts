@@ -13,6 +13,10 @@ export type PkgResult = {
   */
   commands?: string[];
   /**
+  这个包只提供库：它自己没声明 `bin`，一条命令也不会有，链上本体就是干完了活
+  */
+  libraryOnly?: boolean;
+  /**
   本次补上了包自己解析不到的依赖
   */
   depsLinked?: boolean;
@@ -24,10 +28,9 @@ export type PkgResult = {
 };
 
 /**
-没装上：全局目录里压根没有这个包，或它没有可执行文件。
+没装上：全局目录里压根没有这个包，或环境没配好到探不出任何一层布局。
 
-这两种是「没干活」，只有原因没有命令；前者能修（`pnpm setup` 或装上），
-后者只能换一个包——CLI 给的提示完全不同。
+两种都是「没干活」，只有原因没有命令，而修法不同——一个去装，一个去配。
 */
 export type LocateFailure = {
   pkg: string;
@@ -35,7 +38,6 @@ export type LocateFailure = {
   探过的候选位置，留在结论里便于定位「探的是哪儿」
   */
   pkgDirs: string[];
-  noBin?: boolean;
   notFound?: boolean;
   globalBinDir?: boolean;
 };
@@ -43,7 +45,7 @@ export type LocateFailure = {
 /**
 每个包只能落在一种处境里。
 
-处处都是 `?` 的对象谁都能拼出一个自相矛盾的结果（「找不到包」又「没有可执行文件」），
+处处都是 `?` 的对象谁都能拼出一个自相矛盾的结果（「找不到包」又「补了依赖」），
 读的人还得记住哪些字段互斥；用联合类型把这份约定交给编译器，下游照着取就行。
 
 判据只在这一个文件里：`isLocateFailed`、`isLinked`、`isEnvFailure` 与类型定义摆在一起，
@@ -55,9 +57,7 @@ export type Outcome = LocateFailure | PkgResult;
 没干活的那几种：没命令，只有原因
 */
 export function isLocateFailed(outcome: Outcome): outcome is LocateFailure {
-  return (
-    'notFound' in outcome || 'noBin' in outcome || 'globalBinDir' in outcome
-  );
+  return 'notFound' in outcome || 'globalBinDir' in outcome;
 }
 
 /**
@@ -70,7 +70,7 @@ export function isLinked(outcome: Outcome): outcome is PkgResult {
 /**
 环境问题比「这个包链不上」更该让人去修，得算进退出码。
 
-`noBin` 不算：包里没命令是包自己的事，装了别的包照样能跑。
+包自己没命令不在这儿报：它作为库被链进工程了，这一趟是有收获的。
 */
 export function isEnvFailure(outcome: Outcome): boolean {
   return (

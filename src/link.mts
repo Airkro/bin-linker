@@ -146,9 +146,10 @@ async function verifyDeps(
 async function runPlan(pkg: string, plan: LinkPlan): Promise<PkgResult> {
   // 包本体与全部命令都落在工程自己的 node_modules 里。
   // 候选位置按新到旧一起交给链接：任意一份已到位就不重建，要建就建最新那份。
+  // 本地那份（npm 解压装的那种目录）由这一次点名换掉：目的就是用全局这一份
   const madeDirs = await prepareDirs(plan);
 
-  await createSymlink(plan.pkgLink, plan.pkgDirs);
+  await createSymlink(plan.pkgLink, plan.pkgDirs, { replaceDir: true });
 
   // 补依赖与建命令链接互不相干，并行：补依赖要读 store 那张表，动辄几十个 syscall。
   // 补依赖是附赠的，补不上不影响已建好的命令链接。
@@ -166,7 +167,14 @@ async function runPlan(pkg: string, plan: LinkPlan): Promise<PkgResult> {
   // 一件都没落下就把铺出来的目录撤掉：工程里不该多出空的 node_modules
   await dropEmptyDirs(madeDirs);
 
-  return { pkg, ...linkResult, depsLinked, unresolved };
+  return {
+    pkg,
+    ...linkResult,
+    // 一条命令也没有不等于白跑：这个包作为库落在工程的 node_modules 里了
+    libraryOnly: plan.binEntries.length === 0,
+    depsLinked,
+    unresolved,
+  };
 }
 
 async function linkPackageBin(pkg: string): Promise<Outcome> {

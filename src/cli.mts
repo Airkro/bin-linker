@@ -42,7 +42,7 @@ export async function run(): Promise<number> {
     log.warn('请指定要链接的包名');
     log.info('Usage: bin-linker <package-name> [<package-name>...]');
 
-    // 没干活就是失败，跟「没链上任何命令」一个口径
+    // 没干活就是失败，跟「没链上任何东西」一个口径
     return 1;
   }
 
@@ -60,20 +60,32 @@ export async function run(): Promise<number> {
     report(outcome);
   }
 
-  const linkedCount = outcomes.reduce(
+  const commandCount = outcomes.reduce(
     (total, outcome) =>
       total + (isLinked(outcome) ? (outcome.commands?.length ?? 0) : 0),
     0,
   );
+  // 只提供库的包念不出命令，可它确实链进了工程的 node_modules：这也算干了活
+  const libraryCount = outcomes.filter(
+    (outcome) => isLinked(outcome) && outcome.libraryOnly === true,
+  ).length;
 
-  if (linkedCount === 0) {
-    log.warn('没有链接任何命令');
+  if (commandCount === 0 && libraryCount === 0) {
+    log.warn('没有链接任何东西');
 
     return 1;
   }
 
   if (outcomes.length > 1) {
-    log.info(`共链接了 ${linkedCount} 个命令`);
+    // 「0 个命令」念出来像出了事，这里只报真有的那几档
+    log.info(
+      `共链接了 ${[
+        commandCount > 0 ? `${commandCount} 个命令` : '',
+        libraryCount > 0 ? `${libraryCount} 个库` : '',
+      ]
+        .filter(Boolean)
+        .join('、')}`,
+    );
   }
 
   // 全局 bin 目录不在 PATH、包没装，都是得让人去处理的事，不能因为别的包链上了就报成功。

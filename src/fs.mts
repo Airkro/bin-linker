@@ -161,7 +161,7 @@ export async function findUnresolvedDeps(
       .map((name) => rootOf(name))
       .filter((name) => name && !isBuiltin(name))
       .map(async (name) => {
-        const tail = name.split('/').at(-1) ?? name;
+        const tail = name.slice(name.lastIndexOf('/') + 1);
         const [found, sub] = await Promise.all([
           resolveTo(require, name),
           resolveTo(require, `${name}/${tail}`),
@@ -311,6 +311,39 @@ export async function isLinkPointsTo(
 }
 
 /**
+位置上那份是不是解压进来的普通目录（npm 装的包就是这个形状）。
+
+判断只看条目自己：链接（含 Windows 的 junction）`lstat` 就说 `isSymbolicLink`，
+`unlink` 撤得动；目录撤不动，得整个删。拿错误码反推不行——同一个动作
+在 Windows 上是 `EPERM`、在 POSIX 上是 `EISDIR`，Windows 那句还会被上游翻成「缺管理员权限」。
+*/
+async function isUnpackedDir(dir: string): Promise<boolean> {
+  const stat = await fs.lstat(dir).catch(() => null);
+
+  return stat?.isDirectory() === true && !stat.isSymbolicLink();
+}
+
+/**
+把包本体那位上占着的本地版本挪开。
+
+只有包本体会走到这儿：工程里 `node_modules/<包名>` 位置上的那份是 `npm install`
+解压出来的，随时装得回来，而「用全局这一份」正是这次点名的目的。
+删之前认两件事——名字得像个包、里头得有 `package.json`：`node_modules/@scope`
+这种装着整组包的目录，或人手放上去的别的东西，都不该被扫掉。
+*/
+async function dropLocalCopy(link: string): Promise<void> {
+  const name = path.basename(link);
+
+  if (!isPackageEntry(name) || !(await readPackageJson(link))) {
+    throw new Error(
+      `位置上的东西不像一个包，没有替它挪开: ${link}；请先自己处理再重跑`,
+    );
+  }
+
+  await fs.rm(link, { recursive: true, force: true });
+}
+
+/**
 把 `link` 指向 `targets` 里第一份真在的东西，已经指着其中任意一份就跳过。
 
 `targets` 是同一个东西的多个候选位置（包可能同时留在几个版本目录里）。
@@ -319,10 +352,14 @@ export async function isLinkPointsTo(
 
 建链的对象必须挑一份存在的：候选表里常有不存在的层（pnpm 12 的
 `global/v11/node_modules` 就只是个空壳），照着排头建等于亲手做一条断链。
+
+`replaceDir` 是「位置被一份解压进来的目录占着也照样换」：只有包本体这么要，
+其余调用（命令、依赖）碰到的都是链接或空位。
 */
 export async function createSymlink(
   link: string,
   targets: string[],
+  { replaceDir = false }: { replaceDir?: boolean } = {},
 ): Promise<void> {
   if (await isLinkPointsTo(link, targets)) {
     return;
@@ -335,10 +372,18 @@ export async function createSymlink(
   }
 
   // 不存在的链接当它已经删掉了
-  await fs.unlink(link).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== 'ENOENT') {
-      throw error;
+  await fs.unlink(link).catch(async (error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') {
+      return;
     }
+
+    if (replaceDir && (await isUnpackedDir(link))) {
+      await dropLocalCopy(link);
+
+      return;
+    }
+
+    throw error;
   });
 
   await fs.symlink(target, link, getLinkType(target));

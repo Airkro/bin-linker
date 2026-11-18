@@ -32,6 +32,9 @@ export type LinkPlan = {
   实际读到元数据的那一份，它的路径才是命令与依赖该用的路径
   */
   pkgDir: string;
+  /**
+  要链的命令。包没声明 `bin` 时这份是空的——它只作为库被链进工程
+  */
   binEntries: BinEntry[];
   /**
   要补进包里的依赖：链接位置与来源
@@ -210,11 +213,6 @@ export async function planPackageLinks(
 
   const { pkgDir, depots, bin, deps: declared = [] } = picked;
   const binEntries = bin ? getBinEntries(pkg, bin) : [];
-
-  // 没有 bin 的包连本体都不用链：它只提供库，工程里用不着它
-  if (binEntries.length === 0) {
-    return { pkg, pkgDirs, noBin: true };
-  }
 
   const planned = await Promise.all(
     depots.map((depot) => planDeps(pkg, pkgDir, depot)),

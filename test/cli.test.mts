@@ -67,7 +67,7 @@ describe('cli', () => {
   });
 
   it('shows usage and fails when no packages are supplied', async () => {
-    // 没干活就是失败，跟「没链上任何命令」一个口径
+    // 没干活就是失败，跟「没链上任何东西」一个口径
     await expect(run()).resolves.toBe(1);
     expect(mocks.warn).toHaveBeenCalled();
     expect(mocks.linkPackageBins).not.toHaveBeenCalled();
@@ -79,7 +79,7 @@ describe('cli', () => {
     await expect(
       runWith([
         { pkg: 'missing', notFound: true },
-        { pkg: 'empty', noBin: true },
+        { pkg: 'empty', commands: [], libraryOnly: true },
         { pkg: 'tool', commands: ['tool'] },
       ]),
     ).resolves.toBe(1);
@@ -136,7 +136,7 @@ describe('cli', () => {
       ]),
     ).resolves.toBe(1);
     expect(said(mocks.error.mock.calls, '链接 broken 失败')).toBeDefined();
-    expect(said(mocks.warn.mock.calls, '没有链接任何命令')).toBeDefined();
+    expect(said(mocks.warn.mock.calls, '没有链接任何东西')).toBeDefined();
   });
 
   it('mentions dependency links right after the commands it fixed', async () => {
@@ -168,13 +168,92 @@ describe('cli', () => {
     expect(said(mocks.info.mock.calls, 'pnpm add -g tool')).toBeDefined();
   });
 
-  it('does not mention dependency links when nothing was linked', async () => {
+  it('shortens a long list of broken dependencies', async () => {
+    // 一次报出十几个断开的依赖名字没人会读：念五个，剩下的用省略号带过
     process.argv = ['node', 'bin-linker', 'tool'];
 
     await expect(
-      runWith([{ pkg: 'tool', noBin: true, depsLinked: true }]),
+      runWith([
+        {
+          pkg: 'tool',
+          commands: ['tool'],
+          unresolved: ['one', 'two', 'three', 'four', 'five', 'six'],
+        },
+      ]),
     ).resolves.toBe(1);
-    expect(said(mocks.info.mock.calls, '补全')).toBeUndefined();
+
+    const line = String(said(mocks.error.mock.calls, '依赖解析不到'));
+
+    expect(line).toContain('one');
+    expect(line.trimEnd().endsWith('…')).toBe(true);
+  });
+
+  it('mentions dependency links for a package with no commands', async () => {
+    // 库也会断在间接依赖上：补过就要说，不然人不知道 store 里多了那些链接
+    process.argv = ['node', 'bin-linker', 'library'];
+
+    await expect(
+      runWith([
+        { pkg: 'library', commands: [], libraryOnly: true, depsLinked: true },
+      ]),
+    ).resolves.toBe(0);
+    expect(said(mocks.info.mock.calls, '补全依赖')).toContain('library');
+  });
+
+  it('counts a package that only provides a library as work done', async () => {
+    // 没有命令的包链上了本体就是干了活：念不出命令不该让这趟变成一次失败
+    process.argv = ['node', 'bin-linker', 'library'];
+
+    await expect(
+      runWith([{ pkg: 'library', commands: [], libraryOnly: true }]),
+    ).resolves.toBe(0);
+    expect(said(mocks.info.mock.calls, '已链入工程')).toContain('library');
+  });
+
+  it('counts the libraries in the total', async () => {
+    process.argv = ['node', 'bin-linker', 'tool', 'library'];
+
+    await expect(
+      runWith([
+        { pkg: 'tool', commands: ['tool'] },
+        { pkg: 'library', commands: [], libraryOnly: true },
+      ]),
+    ).resolves.toBe(0);
+    expect(said(mocks.info.mock.calls, '共链接了')).toContain('1 个库');
+  });
+
+  it('does not report a zero command total when only libraries linked', async () => {
+    // 「0 个命令」念出来像出了事：这一趟是链上了两个库，不是什么都没干
+    process.argv = ['node', 'bin-linker', 'first', 'second'];
+
+    await expect(
+      runWith([
+        { pkg: 'first', commands: [], libraryOnly: true },
+        { pkg: 'second', commands: [], libraryOnly: true },
+      ]),
+    ).resolves.toBe(0);
+
+    const total = said(mocks.info.mock.calls, '共链接了');
+
+    expect(total).toContain('2 个库');
+    expect(total).not.toContain('命令');
+  });
+
+  it('fails when a linked library still has a broken dependency', async () => {
+    // 库里用间接依赖同样会炸：链上本体不等于这个包能用
+    process.argv = ['node', 'bin-linker', 'library'];
+
+    await expect(
+      runWith([
+        {
+          pkg: 'library',
+          commands: [],
+          libraryOnly: true,
+          unresolved: ['moment'],
+        },
+      ]),
+    ).resolves.toBe(1);
+    expect(said(mocks.error.mock.calls, '依赖解析不到')).toContain('moment');
   });
 
   it('fails when the pnpm global bin directory is missing from PATH', async () => {

@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   readdir: vi.fn(),
   readlink: vi.fn(),
   realpath: vi.fn(),
+  rm: vi.fn(),
   symlink: vi.fn(),
   unlink: vi.fn(),
 }));
@@ -25,6 +26,7 @@ vi.mock('node:fs', () => ({
     readdir: mocks.readdir,
     readlink: mocks.readlink,
     realpath: mocks.realpath,
+    rm: mocks.rm,
     symlink: mocks.symlink,
     unlink: mocks.unlink,
   },
@@ -350,12 +352,117 @@ describe('filesystem helpers', () => {
     platform.mockRestore();
   });
 
+  it('leaves the link type out on platforms that do not need it', async () => {
+    // POSIX 的 symlink 自己就分得清指向的是目录还是文件，多给一个类型反而不对
+    const platform = vi.spyOn(process, 'platform', 'get');
+
+    platform.mockReturnValue('linux');
+
+    await createSymlink('/project/node_modules/tool', [
+      '/global/node_modules/tool',
+    ]);
+    expect(mocks.symlink).toHaveBeenCalledWith(
+      '/global/node_modules/tool',
+      '/project/node_modules/tool',
+      undefined,
+    );
+    platform.mockRestore();
+  });
+
   it('propagates unlink failures other than a missing link', async () => {
     mocks.unlink.mockRejectedValueOnce(new Error('cannot unlink'));
 
     await expect(createSymlink(LINK, [TARGET])).rejects.toThrow(
       'cannot unlink',
     );
+  });
+
+  it('replaces the local version unpacked into the project', async () => {
+    // `npm install` 装出来的是一份解压进来的目录，`unlink` 撤不动：Windows 给 EPERM，
+    // 那句还会被上游翻成「缺管理员权限」。点名要用全局这一份时，本地这份就换掉
+    const local = '/project/node_modules/tool';
+
+    mocks.unlink.mockRejectedValue(
+      Object.assign(new Error('operation not permitted'), { code: 'EPERM' }),
+    );
+    mocks.lstat.mockResolvedValue({
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+    });
+    mocks.readFile.mockResolvedValue('{"name":"tool","version":"1.0.0"}');
+
+    await expect(
+      createSymlink(local, [TARGET], { replaceDir: true }),
+    ).resolves.toBeUndefined();
+    expect(mocks.rm).toHaveBeenCalledWith(local, {
+      recursive: true,
+      force: true,
+    });
+    expect(mocks.symlink).toHaveBeenCalledWith(TARGET, local, linkType(TARGET));
+  });
+
+  it('refuses to drop a directory that does not look like a package', async () => {
+    // `node_modules/@scope` 装着整组包，点号开头的是各家工具的地盘：
+    // 认不出「这就是一个包」就不该替人扫掉
+    mocks.unlink.mockRejectedValue(
+      Object.assign(new Error('operation not permitted'), { code: 'EPERM' }),
+    );
+    mocks.lstat.mockResolvedValue({
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+    });
+    // 那份目录里没有 package.json
+    mocks.readFile.mockRejectedValue(
+      Object.assign(new Error('missing'), { code: 'ENOENT' }),
+    );
+
+    // 一次走「里头没有元数据」，一次走「名字不像包」
+    for (const local of [
+      '/project/node_modules/@scope',
+      '/project/node_modules/tool/.bin',
+    ]) {
+      await expect(
+        createSymlink(local, [TARGET], { replaceDir: true }),
+      ).rejects.toThrow('不像一个包');
+    }
+
+    expect(mocks.rm).not.toHaveBeenCalled();
+    expect(mocks.symlink).not.toHaveBeenCalled();
+  });
+
+  it('keeps the original failure when the slot is not a directory', async () => {
+    // 文件撤不掉是另一回事（占用、只读）：换个说法报错只会把人引开
+    mocks.unlink.mockRejectedValue(
+      Object.assign(new Error('locked'), { code: 'EBUSY' }),
+    );
+    mocks.lstat.mockResolvedValue({
+      isDirectory: () => false,
+      isSymbolicLink: () => false,
+    });
+
+    await expect(
+      createSymlink(LINK, [TARGET], { replaceDir: true }),
+    ).rejects.toThrow('locked');
+    expect(mocks.rm).not.toHaveBeenCalled();
+
+    // lstat 本身就探不到：同样按原话交出去，别猜它是什么形状
+    mocks.lstat.mockRejectedValue(new Error('gone'));
+
+    await expect(
+      createSymlink(LINK, [TARGET], { replaceDir: true }),
+    ).rejects.toThrow('locked');
+
+    // 指着目录的普通软链（不是 junction）在 Windows 上一样撤不动，可它不是「本地那一份包」：
+    // 撤掉它是改链接，删掉它是删数据，两件事不能混着做
+    mocks.lstat.mockResolvedValue({
+      isDirectory: () => true,
+      isSymbolicLink: () => true,
+    });
+
+    await expect(
+      createSymlink(LINK, [TARGET], { replaceDir: true }),
+    ).rejects.toThrow('locked');
+    expect(mocks.rm).not.toHaveBeenCalled();
   });
 });
 
@@ -458,10 +565,50 @@ describe('findUnresolvedDeps', () => {
     ).resolves.toEqual([]);
   });
 
+  it('names a dependency that only resolves outside the package', async () => {
+    // 解析得到，但摸到的是别人那份（工程自己的 `node_modules` 就在上面）：
+    // 换一个工程就又不是这样了，这个包自己还是缺
+    await expect(
+      resolveWith({ moment: '/project/node_modules/moment/index.js' }, [
+        'moment',
+      ]),
+    ).resolves.toEqual(['moment']);
+  });
+
   it('names the dependencies nobody can resolve', async () => {
     await expect(resolveWith({}, ['moment', 'node:fs', 'fs'])).resolves.toEqual(
       ['moment'],
     );
+  });
+
+  // 根与子路径都解析不到时，「真缺」还是「本来就不给根入口」只有这份元数据分得清。
+  // 这五种都没给出一条能接住包名的入口：数组形式、字符串形式、给了根入口、
+  // 键不是子路径、数组里夹了非字符串
+  it.each([
+    '{}',
+    '{"exports":"./index.js"}',
+    '{"exports":{".":"./index.js"}}',
+    '{"exports":{"runtime":"./r.js"}}',
+    '{"exports":[null,"./a.js"]}',
+  ])('names a dependency the manifest cannot excuse: %s', async (manifest) => {
+    mocks.readFile.mockImplementation(async (file: string) =>
+      file === path.join(OWN_DIR, 'moment', 'package.json')
+        ? manifest
+        : Promise.reject(new Error('ENOENT')),
+    );
+
+    await expect(resolveWith({}, ['moment'])).resolves.toEqual(['moment']);
+  });
+
+  it('lets a dependency whose manifest lists only subpaths go', async () => {
+    // `exports` 也可以是数组，只给子路径同样是正常写法：别报成缺东西
+    mocks.readFile.mockImplementation(async (file: string) =>
+      file === path.join(OWN_DIR, 'moment', 'package.json')
+        ? '{"exports":["./a.js"]}'
+        : Promise.reject(new Error('ENOENT')),
+    );
+
+    await expect(resolveWith({}, ['moment'])).resolves.toEqual([]);
   });
 
   it('lets a dependency without a root entry go when a subpath resolves', async () => {
@@ -469,7 +616,7 @@ describe('findUnresolvedDeps', () => {
     // 本来就不成立；它和「东西真缺了」的区别，只有那份 package.json 说得清。
     // 只认自己那份：别的包有没有 package.json 与这条判据无关
     mocks.readFile.mockImplementation(async (file: string) =>
-      file === `${OWN_DIR}/@babel/runtime/package.json`
+      file === path.join(OWN_DIR, '@babel', 'runtime', 'package.json')
         ? JSON.stringify({ exports: { './regenerator': './regenerator.js' } })
         : Promise.reject(new Error('ENOENT')),
     );

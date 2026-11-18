@@ -8,13 +8,13 @@ import {
 } from '../src/result.mts';
 
 /**
-三种「没干活」与两种「干了活」的结论，判据只该落在自己那一档
+两种「没干活」与三种「干了活」的结论，判据只该落在自己那一档
 */
 const cases: [Outcome, boolean, boolean, boolean][] = [
   [{ pkg: 'a', pkgDirs: [], notFound: true }, true, false, true],
   [{ pkg: 'b', pkgDirs: [], globalBinDir: true }, true, false, true],
-  // 包里没有命令是包自己的事：不算环境问题，装了别的包照样能跑
-  [{ pkg: 'c', pkgDirs: [], noBin: true }, true, false, false],
+  // 只提供库的包链上了本体：这趟有收获，不是环境问题
+  [{ pkg: 'c', commands: [], libraryOnly: true }, false, true, false],
   [{ pkg: 'd', commands: ['d'] }, false, true, false],
   [{ pkg: 'e', errors: [] }, false, true, false],
 ];
